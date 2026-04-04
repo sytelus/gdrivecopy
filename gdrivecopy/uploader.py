@@ -287,6 +287,7 @@ class Uploader:
 
         Returns a ``_WorkerResult`` -- never mutates ``self._stats``.
         """
+        auth_retried = False
         for attempt in range(MAX_RETRIES):
             if self._daily_limit_hit.is_set():
                 raise DailyLimitError(403, "Daily limit reached")
@@ -298,11 +299,16 @@ class Uploader:
                 self._backoff(lf, attempt, exc)
             except (DriveApiError, HttpError) as exc:
                 status = exc.status if isinstance(exc, DriveApiError) else exc.resp.status
-                if 400 <= status < 500 and status not in (401, 429):
+                if status == 401:
+                    if auth_retried:
+                        logger.error("Auth failure after token refresh: %s", lf.relative_path)
+                        return _WorkerResult(success=False, error=str(exc), is_permanent=True)
+                    self._refresh_token()
+                    auth_retried = True
+                    continue  # retry immediately, no backoff
+                if 400 <= status < 500 and status not in (429,):
                     logger.error("Permanent failure: %s -- %s", lf.relative_path, exc)
                     return _WorkerResult(success=False, error=str(exc), is_permanent=True)
-                if status == 401:
-                    self._refresh_token()
                 self._backoff(lf, attempt, exc)
             except ChecksumError as exc:
                 # MD5 mismatch -- always retry (file was trashed, re-upload).
@@ -457,9 +463,11 @@ class Uploader:
             )
 
         local_md5 = hasher.hexdigest()
+        # Remove session BEFORE verifying MD5 so a ChecksumError retry
+        # doesn't find a stale "completed" session and report false success.
+        self._session_cache.remove(lf.relative_path)
         self._verify_md5(lf, local_md5, resp)
 
-        self._session_cache.remove(lf.relative_path)
         logger.info("Uploaded: %s (%s)", lf.relative_path, local_md5)
         return _WorkerResult(success=True, bytes_uploaded=lf.size, resumed=resumed)
 
