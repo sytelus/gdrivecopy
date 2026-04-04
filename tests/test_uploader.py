@@ -115,10 +115,9 @@ class TestSmallFileUpload:
         uploader._folder_map = {"": "root-folder-id"}
 
         result = uploader._upload_small(lf, "root-folder-id")
-        assert result is True
+        assert result.success is True
+        assert result.bytes_uploaded == len(content)
         mock_drive.multipart_upload.assert_called_once()
-        assert uploader._stats.files_uploaded == 1
-        assert uploader._stats.bytes_uploaded == len(content)
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +145,10 @@ class TestResumableUpload:
         uploader._file_map = {}
         uploader._folder_map = {"": "root-folder-id"}
 
-        result = uploader._upload_resumable(lf, "root-folder-id", attempt=0)
-        assert result is True
+        result = uploader._upload_resumable(lf, "root-folder-id")
+        assert result.success is True
+        assert result.bytes_uploaded == len(content)
         mock_drive.initiate_resumable_upload.assert_called_once()
-        assert uploader._stats.files_uploaded == 1
-        assert uploader._stats.bytes_uploaded == len(content)
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +187,9 @@ class TestSessionResume:
             ),
         )
 
-        result = uploader._upload_resumable(lf, "root-folder-id", attempt=0)
-        assert result is True
-        assert uploader._stats.files_resumed == 1
+        result = uploader._upload_resumable(lf, "root-folder-id")
+        assert result.success is True
+        assert result.resumed is True
         # Should NOT initiate a new session
         mock_drive.initiate_resumable_upload.assert_not_called()
 
@@ -224,8 +222,8 @@ class TestSessionResume:
             ),
         )
 
-        result = uploader._upload_resumable(lf, "root-folder-id", attempt=0)
-        assert result is True
+        result = uploader._upload_resumable(lf, "root-folder-id")
+        assert result.success is True
         # Must initiate a new session since old one was stale
         mock_drive.initiate_resumable_upload.assert_called_once()
 
@@ -258,8 +256,8 @@ class TestSessionResume:
             ),
         )
 
-        result = uploader._upload_resumable(lf, "root-folder-id", attempt=0)
-        assert result is True
+        result = uploader._upload_resumable(lf, "root-folder-id")
+        assert result.success is True
         mock_drive.initiate_resumable_upload.assert_called_once()
 
     def test_already_completed_session(
@@ -268,11 +266,15 @@ class TestSessionResume:
         mock_drive: MagicMock,
         make_local_file: Any,
     ) -> None:
-        """If query_upload_status returns total (already done), skip re-upload."""
+        """If query_upload_status returns total (already done), start a fresh upload."""
         content = b"d" * (MULTIPART_THRESHOLD + 1024)
         lf = make_local_file(name="done.bin", content=content)
 
+        md5 = hashlib.md5(content).hexdigest()
         mock_drive.query_upload_status.return_value = lf.size  # fully completed
+        mock_drive.upload_chunk.return_value = UploadResponse(
+            file_id="res-id", md5_checksum=md5
+        )
 
         uploader = Uploader(upload_config, mock_drive)
         uploader._file_map = {}
@@ -287,12 +289,11 @@ class TestSessionResume:
             ),
         )
 
-        result = uploader._upload_resumable(lf, "root-folder-id", attempt=0)
-        assert result is True
-        assert uploader._stats.files_resumed == 1
-        assert uploader._stats.files_uploaded == 1
-        # No chunk uploads should happen
-        mock_drive.upload_chunk.assert_not_called()
+        result = uploader._upload_resumable(lf, "root-folder-id")
+        assert result.success is True
+        assert result.resumed is True
+        assert result.bytes_uploaded == 0  # no bytes transferred this run
+        mock_drive.initiate_resumable_upload.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +321,9 @@ class TestMD5Verification:
         uploader._file_map = {}
         uploader._folder_map = {"": "root-folder-id"}
 
-        with pytest.raises(DriveApiError, match="MD5 mismatch"):
+        from gdrivecopy.uploader import ChecksumError
+
+        with pytest.raises(ChecksumError, match="MD5 mismatch"):
             uploader._upload_small(lf, "root-folder-id")
 
         mock_drive.trash_file.assert_called_once_with("bad-id")
@@ -345,7 +348,7 @@ class TestMD5Verification:
         uploader._folder_map = {"": "root-folder-id"}
 
         result = uploader._upload_small(lf, "root-folder-id")
-        assert result is True
+        assert result.success is True
         mock_drive.trash_file.assert_not_called()
 
 
@@ -381,7 +384,7 @@ class TestRetryOnTransientError:
         uploader._folder_map = {"": "root-folder-id"}
 
         result = uploader._upload_one(lf)
-        assert result is True
+        assert result.success is True
         assert mock_drive.multipart_upload.call_count == 2
 
     @patch("gdrivecopy.uploader.time.sleep")
@@ -409,7 +412,7 @@ class TestRetryOnTransientError:
         uploader._folder_map = {"": "root-folder-id"}
 
         result = uploader._upload_one(lf)
-        assert result is True
+        assert result.success is True
 
     def test_permanent_error_does_not_retry(
         self,
@@ -428,7 +431,8 @@ class TestRetryOnTransientError:
         uploader._folder_map = {"": "root-folder-id"}
 
         result = uploader._upload_one(lf)
-        assert result is False
+        assert result.success is False
+        assert result.is_permanent is True
         # Should only be called once (no retry)
         assert mock_drive.multipart_upload.call_count == 1
 
@@ -453,9 +457,8 @@ class TestRetryOnTransientError:
         uploader._folder_map = {"": "root-folder-id"}
 
         result = uploader._upload_one(lf)
-        assert result is False
-        assert uploader._stats.files_failed == 1
-        assert any("max retries" in e for e in uploader._stats.errors)
+        assert result.success is False
+        assert result.error == "max retries exceeded"
 
 
 # ---------------------------------------------------------------------------
@@ -523,15 +526,15 @@ class TestCircuitBreaker:
 
     @patch("gdrivecopy.uploader.time.sleep")
     def test_every_failure_triggers_pause(self, mock_sleep: MagicMock) -> None:
-        """Every record_failure() call sleeps (the sleep is unconditional)."""
+        """The breaker only sleeps when the consecutive failure threshold is reached."""
         breaker = _CircuitBreaker(threshold=3, pause_seconds=30)
 
         breaker.record_failure()
         breaker.record_failure()
         breaker.record_failure()
 
-        # The breaker sleeps on every failure call, not just at threshold.
-        assert mock_sleep.call_count == 3
+        # The breaker sleeps once when threshold (3) is reached on the 3rd failure.
+        assert mock_sleep.call_count == 1
         mock_sleep.assert_called_with(30)
 
     @patch("gdrivecopy.uploader.time.sleep")
@@ -540,12 +543,12 @@ class TestCircuitBreaker:
         breaker = _CircuitBreaker(threshold=2, pause_seconds=10)
 
         breaker.record_failure()
-        breaker.record_failure()  # threshold hit, counter resets to 0
+        breaker.record_failure()  # threshold hit, counter resets to 0, sleeps
         breaker.record_success()  # explicit reset (already 0)
-        breaker.record_failure()  # counter = 1 again, no threshold warning yet
+        breaker.record_failure()  # counter = 1 again, no threshold hit yet
 
-        # 3 failures total, each sleeps
-        assert mock_sleep.call_count == 3
+        # Only 1 sleep: when the threshold was hit on the 2nd failure
+        assert mock_sleep.call_count == 1
 
 
 # ---------------------------------------------------------------------------

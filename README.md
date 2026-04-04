@@ -158,7 +158,6 @@ gdrivecopy upload <source_dir> <drive_folder_id> [options]
   --token PATH           Cached OAuth token (default: ./token.json)
   --sessions PATH        Session cache file (default: ./sessions.json)
   --no-checksum-verify   Skip post-upload MD5 verification
-  --wait-on-limit        Wait and auto-resume when daily limit is hit (default: exit)
   --quiet                Minimal output
 ```
 

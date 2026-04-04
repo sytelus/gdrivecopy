@@ -4,32 +4,43 @@ Wraps both the discovery-based ``googleapiclient`` service (for metadata
 operations like listing and folder creation) and a raw ``AuthorizedSession``
 (for the resumable-upload HTTP protocol).
 
-All public methods raise on unexpected HTTP errors after logging.  Transient
-errors are surfaced to the caller so the ``Uploader`` can apply its own retry
-/ circuit-breaker logic.
+Transient errors are surfaced to the caller so the ``Uploader`` can apply
+its own retry / circuit-breaker logic.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import mimetypes
+import random
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import AuthorizedSession
 from googleapiclient.discovery import build, Resource
+from googleapiclient.errors import HttpError
 
 from gdrivecopy.models import DriveFile
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 DRIVE_API_VERSION = "v3"
 UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+_MAX_API_RETRIES = 5
 
+
+# ------------------------------------------------------------------
+# Response / error types
+# ------------------------------------------------------------------
 
 @dataclass
 class UploadResponse:
@@ -55,6 +66,77 @@ class RateLimitError(DriveApiError):
     """Raised on 429 / 403-rateLimitExceeded so the caller can back off."""
 
 
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _guess_mime(name: str) -> str:
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _file_metadata(
+    name: str,
+    parent_id: str,
+    created_time: str | None = None,
+    modified_time: str | None = None,
+) -> dict[str, Any]:
+    """Build the metadata dict shared by uploads and copies."""
+    meta: dict[str, Any] = {"name": name, "parents": [parent_id]}
+    if created_time:
+        meta["createdTime"] = created_time
+    if modified_time:
+        meta["modifiedTime"] = modified_time
+    return meta
+
+
+def _retry_transient(func: Callable[[], T], description: str = "") -> T:
+    """Call *func* with retries on transient Google API errors.
+
+    Handles both ``HttpError`` (from the discovery client) and
+    ``requests`` connection errors.  Non-retryable errors propagate
+    immediately.
+    """
+    for attempt in range(_MAX_API_RETRIES):
+        try:
+            return func()
+        except HttpError as exc:
+            status = exc.resp.status
+            if status in (429, 500, 502, 503, 504) or (
+                status == 403 and _is_rate_limit_reason(exc)
+            ):
+                delay = min(30, 2 ** attempt) * random.random()
+                logger.warning(
+                    "Transient error during %s (attempt %d/%d), retrying in %.1fs: %s",
+                    description, attempt + 1, _MAX_API_RETRIES, delay, exc,
+                )
+                time.sleep(delay)
+                continue
+            raise
+        except (ConnectionError, OSError) as exc:
+            delay = min(30, 2 ** attempt) * random.random()
+            logger.warning(
+                "Connection error during %s (attempt %d/%d), retrying in %.1fs: %s",
+                description, attempt + 1, _MAX_API_RETRIES, delay, exc,
+            )
+            time.sleep(delay)
+    # Last attempt — let exceptions propagate.
+    return func()
+
+
+def _is_rate_limit_reason(exc: HttpError) -> bool:
+    """Check if an HttpError is a rate-limit error (not daily limit)."""
+    try:
+        body = json.loads(exc.content)
+        reason = body.get("error", {}).get("errors", [{}])[0].get("reason", "")
+        return reason in ("rateLimitExceeded", "userRateLimitExceeded")
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------
+# Client
+# ------------------------------------------------------------------
+
 class DriveClient:
     """Thin wrapper around the Google Drive API v3.
 
@@ -67,7 +149,8 @@ class DriveClient:
         self._service: Resource = build(
             "drive", DRIVE_API_VERSION, credentials=credentials
         )
-        self._http = AuthorizedSession(credentials)
+        # Limit library-internal refresh retries to enforce single-retry-layer.
+        self._http = AuthorizedSession(credentials, max_refresh_attempts=1)
 
     # ------------------------------------------------------------------
     # Listing
@@ -79,7 +162,7 @@ class DriveClient:
         """Recursively list every file and folder under *root_folder_id*.
 
         Returns:
-            A tuple ``(file_map, folder_map)`` where *file_map* maps
+            ``(file_map, folder_map)`` where *file_map* maps
             ``relative_path -> DriveFile`` and *folder_map* maps
             ``relative_path/ -> drive_folder_id``.
         """
@@ -89,7 +172,7 @@ class DriveClient:
         logger.info(
             "Drive scan complete: %d files, %d folders",
             len(file_map),
-            len(folder_map) - 1,  # exclude root
+            len(folder_map) - 1,
         )
         return file_map, folder_map
 
@@ -102,32 +185,30 @@ class DriveClient:
     ) -> None:
         page_token: str | None = None
         while True:
-            resp = (
-                self._service.files()
-                .list(
-                    q=f"'{folder_id}' in parents and trashed=false",
-                    fields=(
-                        "nextPageToken, "
-                        "files(id, name, size, md5Checksum, mimeType)"
-                    ),
-                    pageSize=1000,
-                    pageToken=page_token,
-                )
-                .execute()
+            resp = _retry_transient(
+                lambda pt=page_token: (
+                    self._service.files()
+                    .list(
+                        q=f"'{folder_id}' in parents and trashed=false",
+                        fields=(
+                            "nextPageToken, "
+                            "files(id, name, size, md5Checksum, mimeType)"
+                        ),
+                        pageSize=1000,
+                        pageToken=pt,
+                    )
+                    .execute()
+                ),
+                description=f"listing folder {folder_id}",
             )
             for item in resp.get("files", []):
                 name: str = item["name"]
-                rel = f"{prefix}{name}" if not prefix else f"{prefix}{name}"
-                # When prefix is "", rel is just the name.
-                if not prefix:
-                    rel = name
+                rel = f"{prefix}{name}"
 
                 if item["mimeType"] == FOLDER_MIME:
                     folder_rel = f"{rel}/"
                     folder_map[folder_rel] = item["id"]
-                    self._list_recursive(
-                        item["id"], folder_rel, file_map, folder_map
-                    )
+                    self._list_recursive(item["id"], folder_rel, file_map, folder_map)
                 else:
                     file_map[rel] = DriveFile(
                         id=item["id"],
@@ -144,27 +225,22 @@ class DriveClient:
     # ------------------------------------------------------------------
 
     def create_folder(self, name: str, parent_id: str) -> str:
-        """Create a folder on Drive and return its ID.
-
-        Args:
-            name: Folder display name.
-            parent_id: Drive ID of the parent folder.
-
-        Returns:
-            The new folder's Drive ID.
-        """
+        """Create a folder on Drive and return its ID."""
         body: dict[str, Any] = {
             "name": name,
             "mimeType": FOLDER_MIME,
             "parents": [parent_id],
         }
-        result = self._service.files().create(body=body, fields="id").execute()
+        result = _retry_transient(
+            lambda: self._service.files().create(body=body, fields="id").execute(),
+            description=f"creating folder {name}",
+        )
         folder_id: str = result["id"]
         logger.debug("Created folder %s (id=%s) under %s", name, folder_id, parent_id)
         return folder_id
 
     # ------------------------------------------------------------------
-    # Resumable upload protocol
+    # Resumable upload
     # ------------------------------------------------------------------
 
     def initiate_resumable_upload(
@@ -176,35 +252,20 @@ class DriveClient:
         created_time: str | None = None,
         modified_time: str | None = None,
     ) -> str:
-        """Start a resumable upload session and return the session URI.
-
-        The session URI is valid for one week and can be used to stream
-        chunks or to query the server for the confirmed byte offset.
-        """
-        if mime_type is None:
-            mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-
-        metadata: dict[str, Any] = {
-            "name": name,
-            "parents": [parent_id],
-        }
-        if created_time:
-            metadata["createdTime"] = created_time
-        if modified_time:
-            metadata["modifiedTime"] = modified_time
-
+        """Start a resumable upload session and return the session URI."""
+        metadata = _file_metadata(name, parent_id, created_time, modified_time)
         resp = self._http.post(
             f"{UPLOAD_URL}?uploadType=resumable&fields=id,md5Checksum",
             headers={
                 "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Type": mime_type,
+                "X-Upload-Content-Type": mime_type or _guess_mime(name),
                 "X-Upload-Content-Length": str(file_size),
             },
             data=json.dumps(metadata),
         )
         self._check_errors(resp)
         session_uri = resp.headers["Location"]
-        logger.debug("Initiated resumable upload for %s → %s", name, session_uri[:80])
+        logger.debug("Initiated resumable upload: %s", name)
         return session_uri
 
     def upload_chunk(
@@ -214,21 +275,10 @@ class DriveClient:
         start: int,
         total: int,
     ) -> UploadResponse | None:
-        """Upload a single chunk to an active resumable session.
+        """Upload a single chunk.
 
-        Args:
-            session_uri: URI returned by ``initiate_resumable_upload``.
-            data: The chunk bytes to upload.
-            start: Byte offset of the first byte in *data*.
-            total: Total file size.
-
-        Returns:
-            An ``UploadResponse`` if this was the final chunk (server
-            returned 200/201).  ``None`` if the server returned 308
-            (more chunks expected).
-
-        Raises:
-            DriveApiError: On unexpected HTTP errors.
+        Returns an ``UploadResponse`` on the final chunk (200/201),
+        ``None`` on 308 (more chunks expected).
         """
         end = start + len(data) - 1
         resp = self._http.put(
@@ -239,28 +289,22 @@ class DriveClient:
             },
             data=data,
         )
-
         if resp.status_code in (200, 201):
             body = resp.json()
-            return UploadResponse(
-                file_id=body["id"],
-                md5_checksum=body.get("md5Checksum"),
-            )
+            return UploadResponse(file_id=body["id"], md5_checksum=body.get("md5Checksum"))
         if resp.status_code == 308:
-            return None  # server wants more chunks
-
+            return None
         self._check_errors(resp)
-        return None  # unreachable; _check_errors raises
+        return None  # unreachable
 
     def query_upload_status(self, session_uri: str, total: int) -> int:
-        """Query a resumable session for the confirmed byte offset.
+        """Query a resumable session for the confirmed byte count.
 
-        Returns:
-            The number of bytes the server has confirmed receiving.
-            Returns ``0`` if the server has received nothing.
+        Returns the number of bytes confirmed, or ``total`` if the upload
+        already completed.
 
         Raises:
-            DriveApiError: If the session has expired (404) or other error.
+            DriveApiError: On session expiry (404) or other error.
         """
         resp = self._http.put(
             session_uri,
@@ -272,7 +316,6 @@ class DriveClient:
                 return int(range_header.split("-")[1]) + 1
             return 0
         if resp.status_code in (200, 201):
-            # Upload was already completed (e.g. from another machine).
             return total
         self._check_errors(resp)
         return 0  # unreachable
@@ -291,48 +334,29 @@ class DriveClient:
         modified_time: str | None = None,
     ) -> UploadResponse:
         """Upload a small file (≤ 8 MiB) in a single multipart request."""
-        if mime_type is None:
-            mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        metadata = _file_metadata(name, parent_id, created_time, modified_time)
+        content_type = mime_type or _guess_mime(name)
 
-        metadata: dict[str, Any] = {
-            "name": name,
-            "parents": [parent_id],
-        }
-        if created_time:
-            metadata["createdTime"] = created_time
-        if modified_time:
-            metadata["modifiedTime"] = modified_time
-
-        import email.generator
-        import io
-
-        boundary = "gdrivecopy_boundary"
+        boundary = f"gdrivecopy_{uuid.uuid4().hex}"
         body = io.BytesIO()
-        # Part 1: metadata
         body.write(f"--{boundary}\r\n".encode())
         body.write(b"Content-Type: application/json; charset=UTF-8\r\n\r\n")
         body.write(json.dumps(metadata).encode())
         body.write(b"\r\n")
-        # Part 2: file content
         body.write(f"--{boundary}\r\n".encode())
-        body.write(f"Content-Type: {mime_type}\r\n\r\n".encode())
+        body.write(f"Content-Type: {content_type}\r\n\r\n".encode())
         body.write(file_path.read_bytes())
         body.write(b"\r\n")
         body.write(f"--{boundary}--\r\n".encode())
 
         resp = self._http.post(
             f"{UPLOAD_URL}?uploadType=multipart&fields=id,md5Checksum",
-            headers={
-                "Content-Type": f"multipart/related; boundary={boundary}",
-            },
+            headers={"Content-Type": f"multipart/related; boundary={boundary}"},
             data=body.getvalue(),
         )
         self._check_errors(resp)
         result = resp.json()
-        return UploadResponse(
-            file_id=result["id"],
-            md5_checksum=result.get("md5Checksum"),
-        )
+        return UploadResponse(file_id=result["id"], md5_checksum=result.get("md5Checksum"))
 
     # ------------------------------------------------------------------
     # File operations
@@ -340,38 +364,13 @@ class DriveClient:
 
     def trash_file(self, file_id: str) -> None:
         """Move a file to the Drive trash (recoverable)."""
-        self._service.files().update(
-            fileId=file_id, body={"trashed": True}
-        ).execute()
+        _retry_transient(
+            lambda: self._service.files().update(
+                fileId=file_id, body={"trashed": True}
+            ).execute(),
+            description=f"trashing file {file_id}",
+        )
         logger.info("Trashed file %s", file_id)
-
-    def copy_file(
-        self,
-        source_file_id: str,
-        name: str,
-        parent_id: str,
-        created_time: str | None = None,
-        modified_time: str | None = None,
-    ) -> UploadResponse:
-        """Server-side copy of an existing Drive file (instant, no bandwidth)."""
-        body: dict[str, Any] = {
-            "name": name,
-            "parents": [parent_id],
-        }
-        if created_time:
-            body["createdTime"] = created_time
-        if modified_time:
-            body["modifiedTime"] = modified_time
-
-        result = (
-            self._service.files()
-            .copy(fileId=source_file_id, body=body, fields="id,md5Checksum")
-            .execute()
-        )
-        return UploadResponse(
-            file_id=result["id"],
-            md5_checksum=result.get("md5Checksum"),
-        )
 
     # ------------------------------------------------------------------
     # Error handling
@@ -394,8 +393,11 @@ class DriveClient:
         status = resp.status_code
         full_msg = f"HTTP {status}: {message}"
 
-        if status == 403 and "dailyLimitExceeded" in (reason + message):
+        if status == 403 and "dailyLimitExceeded" in reason:
             raise DailyLimitError(status, full_msg)
-        if status in (429,) or (status == 403 and "rateLimitExceeded" in reason):
+        if status == 429 or (
+            status == 403
+            and reason in ("rateLimitExceeded", "userRateLimitExceeded")
+        ):
             raise RateLimitError(status, full_msg)
         raise DriveApiError(status, full_msg)

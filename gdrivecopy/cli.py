@@ -78,10 +78,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip post-upload MD5 verification",
     )
     upload.add_argument(
-        "--wait-on-limit", action="store_true",
-        help="Wait and auto-resume when daily limit is hit (default: exit)",
-    )
-    upload.add_argument(
         "--quiet", action="store_true",
         help="Minimal output",
     )
@@ -160,7 +156,6 @@ def main(argv: list[str] | None = None) -> None:
             token_path=args.token,
             session_path=args.sessions,
             verify_checksum=not args.no_checksum_verify,
-            wait_on_limit=args.wait_on_limit,
             quiet=args.quiet,
             log_dir=args.log_dir,
             log_level=args.log_level,

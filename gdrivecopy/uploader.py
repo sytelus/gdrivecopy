@@ -7,21 +7,29 @@ Implements the three-phase workflow described in the PRD:
    on Drive, upload the rest with concurrent workers.
 3. **Report** -- print a summary.
 
-Thread safety: upload workers run in a ``ThreadPoolExecutor``.  The shared
-``DriveClient`` uses ``AuthorizedSession`` which handles token refresh with
-its own lock.  The ``SessionCache`` is internally locked.  The ``UploadStats``
-counters are updated only from the main thread after futures complete.
+Thread safety
+-------------
+Upload workers run in a ``ThreadPoolExecutor``.  Workers return a result
+dataclass; **all** ``UploadStats`` mutations happen in the main thread after
+a future completes.  The ``SessionCache`` is internally locked.  The
+``_folder_map`` is guarded by ``_folder_lock`` to prevent duplicate folder
+creation.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
+import itertools
 import logging
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, Future
+from dataclasses import dataclass
+
+from google.auth.transport.requests import Request
+from googleapiclient.errors import HttpError
 
 from gdrivecopy.drive import (
     DriveApiError,
@@ -37,18 +45,40 @@ from gdrivecopy.models import (
     UploadConfig,
     UploadStats,
 )
-from gdrivecopy.scanner import scan_local
+from gdrivecopy.scanner import scan_local, ScanResult
 from gdrivecopy.session import SessionCache
 
 logger = logging.getLogger(__name__)
 
-# Files at or below this size use multipart upload (single request).
 MULTIPART_THRESHOLD = 8 * 1024 * 1024  # 8 MiB
 MAX_RETRIES = 8
 
 
+class ChecksumError(Exception):
+    """Raised when the post-upload MD5 does not match the local file."""
+
+
+# ------------------------------------------------------------------
+# Worker result (returned by _upload_one, consumed by main thread)
+# ------------------------------------------------------------------
+
+@dataclass
+class _WorkerResult:
+    """Immutable result returned by a worker thread."""
+
+    success: bool
+    bytes_uploaded: int = 0
+    resumed: bool = False
+    error: str | None = None
+    is_permanent: bool = False
+
+
+# ------------------------------------------------------------------
+# Circuit breaker
+# ------------------------------------------------------------------
+
 class _CircuitBreaker:
-    """Simple circuit breaker: pauses after N consecutive failures."""
+    """Pauses uploads after *threshold* consecutive failures."""
 
     def __init__(self, threshold: int = 10, pause_seconds: int = 60) -> None:
         self._threshold = threshold
@@ -61,6 +91,7 @@ class _CircuitBreaker:
             self._consecutive_failures = 0
 
     def record_failure(self) -> None:
+        should_pause = False
         with self._lock:
             self._consecutive_failures += 1
             if self._consecutive_failures >= self._threshold:
@@ -70,9 +101,14 @@ class _CircuitBreaker:
                     self._pause,
                 )
                 self._consecutive_failures = 0
-        # Sleep outside lock so other threads aren't blocked.
-        time.sleep(self._pause)
+                should_pause = True
+        if should_pause:
+            time.sleep(self._pause)
 
+
+# ------------------------------------------------------------------
+# Uploader
+# ------------------------------------------------------------------
 
 class Uploader:
     """Orchestrates the full upload workflow.
@@ -90,45 +126,41 @@ class Uploader:
         self._breaker = _CircuitBreaker()
         self._daily_limit_hit = threading.Event()
 
-        # Populated during Phase 1.
+        # Populated during Phase 1, guarded by _folder_lock for writes.
         self._file_map: dict[str, DriveFile] = {}
         self._folder_map: dict[str, str] = {}
+        self._folder_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def run(self) -> UploadStats:
-        """Execute the full scan → upload → report workflow.
-
-        Returns:
-            Final upload statistics.
-        """
+        """Execute the full scan -> upload -> report workflow."""
         start = time.monotonic()
 
-        # Phase 1: Scan Drive
+        # Phase 1: Scan Drive.
         logger.info("Phase 1: Scanning Drive folder %s", self._config.drive_folder_id)
         self._file_map, self._folder_map = self._drive.list_all(
             self._config.drive_folder_id
         )
-
-        # Load the session cache (if present).
         self._session_cache.load()
 
-        # Phase 2: Scan local & upload
+        # Phase 2: Scan local & decide.
         logger.info("Phase 2: Scanning local directory %s", self._config.source_dir)
+        scan = scan_local(self._config.source_dir)
+        self._stats.symlinks_skipped = scan.symlinks_skipped
         files_to_upload: list[LocalFile] = []
 
-        for lf in scan_local(self._config.source_dir):
+        for lf in scan.files:
             self._stats.files_scanned += 1
             action = self._classify(lf)
-
             if action == "skip":
                 self._stats.files_skipped += 1
             elif action == "size_mismatch":
                 self._stats.files_skipped += 1
                 self._stats.size_mismatches += 1
-            elif action == "upload":
+            else:
                 files_to_upload.append(lf)
 
         logger.info(
@@ -147,18 +179,14 @@ class Uploader:
         return self._stats
 
     # ------------------------------------------------------------------
-    # Classification
+    # Classification (main thread only)
     # ------------------------------------------------------------------
 
     def _classify(self, lf: LocalFile) -> str:
-        """Decide whether to skip or upload a local file.
-
-        Returns one of ``"skip"``, ``"size_mismatch"``, or ``"upload"``.
-        """
+        """Return ``"skip"``, ``"size_mismatch"``, or ``"upload"``."""
         drive_file = self._file_map.get(lf.relative_path)
         if drive_file is None:
             return "upload"
-
         if drive_file.size == lf.size:
             logger.debug("Skipping (on Drive, same size): %s", lf.relative_path)
             return "skip"
@@ -172,102 +200,174 @@ class Uploader:
         return "size_mismatch"
 
     # ------------------------------------------------------------------
-    # Concurrent upload
+    # Concurrent upload dispatch (main thread handles stats)
     # ------------------------------------------------------------------
 
     def _upload_all(self, files: list[LocalFile]) -> None:
-        """Upload all files using a thread pool."""
-        logger.info("Uploading %d files with %d workers", len(files), self._config.transfers)
+        """Upload files using a thread pool with bounded submission.
+
+        At most ``transfers`` futures are outstanding at any time, so memory
+        usage stays constant regardless of how many files need uploading.
+        """
+        logger.info(
+            "Uploading %d files with %d workers",
+            len(files),
+            self._config.transfers,
+        )
+        file_iter = iter(files)
 
         with ThreadPoolExecutor(max_workers=self._config.transfers) as pool:
-            futures: dict[Future[bool], LocalFile] = {}
-            for lf in files:
-                if self._daily_limit_hit.is_set():
-                    break
-                fut = pool.submit(self._upload_one, lf)
-                futures[fut] = lf
+            pending: dict[Future[_WorkerResult], LocalFile] = {}
 
-            for fut in as_completed(futures):
-                lf = futures[fut]
-                try:
-                    success = fut.result()
-                    if success:
-                        self._breaker.record_success()
-                except DailyLimitError:
-                    self._stats.daily_limit_hits += 1
-                    self._daily_limit_hit.set()
-                    logger.error(
-                        "Daily upload limit (750 GB) reached. "
-                        "Re-run the tool after ~24 hours."
-                    )
-                    # Cancel pending futures.
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    break
-                except Exception as exc:
-                    self._breaker.record_failure()
-                    self._stats.files_failed += 1
-                    self._stats.errors.append(f"{lf.relative_path}: {exc}")
-                    logger.error("Failed: %s -- %s", lf.relative_path, exc)
+            # Seed the pool with up to `transfers` tasks.
+            for lf in itertools.islice(file_iter, self._config.transfers):
+                pending[pool.submit(self._upload_one, lf)] = lf
+
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    lf = pending.pop(fut)
+                    stop = self._handle_result(fut, lf)
+                    if stop:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        pending.clear()
+                        break
+
+                # Submit more work to keep the pool full.
+                if not self._daily_limit_hit.is_set():
+                    for lf in itertools.islice(
+                        file_iter,
+                        self._config.transfers - len(pending),
+                    ):
+                        pending[pool.submit(self._upload_one, lf)] = lf
+
+    def _handle_result(self, fut: Future[_WorkerResult], lf: LocalFile) -> bool:
+        """Process a completed future.  Returns True to stop all uploads."""
+        try:
+            result = fut.result()
+        except DailyLimitError:
+            self._stats.daily_limit_hits += 1
+            self._daily_limit_hit.set()
+            logger.error(
+                "Daily limit (750 GB) reached. "
+                "Re-run the tool after ~24 hours to continue."
+            )
+            return True
+        except Exception as exc:
+            self._breaker.record_failure()
+            self._stats.files_failed += 1
+            self._stats.errors.append(f"{lf.relative_path}: {exc}")
+            logger.error("Failed: %s -- %s", lf.relative_path, exc)
+            return False
+
+        if result.success:
+            self._stats.files_uploaded += 1
+            self._stats.bytes_uploaded += result.bytes_uploaded
+            if result.resumed:
+                self._stats.files_resumed += 1
+            self._breaker.record_success()
+        else:
+            self._stats.files_failed += 1
+            if result.error:
+                self._stats.errors.append(f"{lf.relative_path}: {result.error}")
+            if not result.is_permanent:
+                self._breaker.record_failure()
+        return False
 
     # ------------------------------------------------------------------
-    # Single-file upload
+    # Single-file upload (runs in a worker thread)
     # ------------------------------------------------------------------
 
-    def _upload_one(self, lf: LocalFile) -> bool:
-        """Upload a single file with retries.  Returns True on success."""
+    def _upload_one(self, lf: LocalFile) -> _WorkerResult:
+        """Upload a single file with retries.
+
+        Returns a ``_WorkerResult`` -- never mutates ``self._stats``.
+        """
         for attempt in range(MAX_RETRIES):
             if self._daily_limit_hit.is_set():
                 raise DailyLimitError(403, "Daily limit reached")
             try:
-                return self._upload_one_attempt(lf, attempt)
+                return self._upload_one_attempt(lf)
             except DailyLimitError:
-                raise  # bubble up immediately
+                raise
             except RateLimitError as exc:
-                delay = min(60, 2 ** attempt) * random.random()
-                logger.warning(
-                    "Rate limited on %s (attempt %d/%d), backing off %.1fs: %s",
-                    lf.relative_path, attempt + 1, MAX_RETRIES, delay, exc,
-                )
-                time.sleep(delay)
-            except DriveApiError as exc:
-                if exc.status < 500 and exc.status not in (429,):
-                    # Permanent client error -- no point retrying.
-                    self._stats.files_failed += 1
-                    self._stats.errors.append(f"{lf.relative_path}: {exc}")
+                self._backoff(lf, attempt, exc)
+            except (DriveApiError, HttpError) as exc:
+                status = exc.status if isinstance(exc, DriveApiError) else exc.resp.status
+                if 400 <= status < 500 and status not in (401, 429):
                     logger.error("Permanent failure: %s -- %s", lf.relative_path, exc)
-                    return False
-                delay = min(60, 2 ** attempt) * random.random()
-                logger.warning(
-                    "Transient error on %s (attempt %d/%d), retrying in %.1fs: %s",
-                    lf.relative_path, attempt + 1, MAX_RETRIES, delay, exc,
-                )
-                time.sleep(delay)
+                    return _WorkerResult(success=False, error=str(exc), is_permanent=True)
+                if status == 401:
+                    self._refresh_token()
+                self._backoff(lf, attempt, exc)
+            except ChecksumError as exc:
+                # MD5 mismatch -- always retry (file was trashed, re-upload).
+                self._backoff(lf, attempt, exc)
+            except ConnectionError as exc:
+                # Network failure (e.g. requests.ConnectionError, which is a
+                # subclass of builtins.ConnectionError -> OSError).  Must be
+                # caught before the OSError handler to avoid treating network
+                # blips as permanent local-read failures.
+                self._backoff(lf, attempt, exc)
             except OSError as exc:
-                self._stats.files_failed += 1
-                self._stats.errors.append(f"{lf.relative_path}: {exc}")
+                # Genuine local I/O error (disk read failure, permission denied).
                 logger.error("Local read error: %s -- %s", lf.relative_path, exc)
-                return False
+                return _WorkerResult(success=False, error=str(exc), is_permanent=True)
 
-        # Exhausted retries.
-        self._stats.files_failed += 1
-        self._stats.errors.append(f"{lf.relative_path}: max retries exceeded")
         logger.error("Max retries exceeded: %s", lf.relative_path)
-        return False
+        return _WorkerResult(success=False, error="max retries exceeded")
 
-    def _upload_one_attempt(self, lf: LocalFile, attempt: int) -> bool:
-        """Single upload attempt for one file.  Returns True on success."""
+    def _refresh_token(self) -> None:
+        """Attempt to refresh the OAuth token."""
+        try:
+            self._drive._creds.refresh(Request())
+            logger.info("OAuth token refreshed")
+        except Exception as exc:
+            logger.warning("Token refresh failed: %s", exc)
+
+    @staticmethod
+    def _backoff(lf: LocalFile, attempt: int, exc: Exception) -> None:
+        delay = min(60, 2 ** attempt) * random.random()
+        logger.warning(
+            "%s (attempt %d/%d), backing off %.1fs: %s",
+            lf.relative_path, attempt + 1, MAX_RETRIES, delay, exc,
+        )
+        time.sleep(delay)
+
+    def _upload_one_attempt(self, lf: LocalFile) -> _WorkerResult:
+        """Single upload attempt."""
         parent_id = self._ensure_parent_folder(lf.relative_path)
-
         if lf.size <= MULTIPART_THRESHOLD:
             return self._upload_small(lf, parent_id)
-        return self._upload_resumable(lf, parent_id, attempt)
+        return self._upload_resumable(lf, parent_id)
+
+    # ------------------------------------------------------------------
+    # MD5 verification (shared by small + resumable paths)
+    # ------------------------------------------------------------------
+
+    def _verify_md5(
+        self, lf: LocalFile, local_md5: str, response: UploadResponse
+    ) -> None:
+        """Compare local MD5 with Drive's.  Trash and raise on mismatch."""
+        if not self._config.verify_checksum or not response.md5_checksum:
+            return
+        if local_md5 == response.md5_checksum:
+            return
+        logger.error(
+            "MD5 mismatch for %s: local=%s drive=%s",
+            lf.relative_path, local_md5, response.md5_checksum,
+        )
+        self._drive.trash_file(response.file_id)
+        raise ChecksumError(f"MD5 mismatch: {lf.relative_path}")
 
     # ------------------------------------------------------------------
     # Small-file upload
     # ------------------------------------------------------------------
 
-    def _upload_small(self, lf: LocalFile, parent_id: str) -> bool:
-        """Upload a file ≤ 8 MiB with a single multipart request."""
+    def _upload_small(self, lf: LocalFile, parent_id: str) -> _WorkerResult:
+        """Upload a file <= 8 MiB with a single multipart request."""
         logger.info("Uploading (small): %s (%d bytes)", lf.relative_path, lf.size)
 
         result = self._drive.multipart_upload(
@@ -277,74 +377,25 @@ class Uploader:
             created_time=lf.ctime,
             modified_time=lf.mtime,
         )
+        local_md5 = hashlib.md5(lf.path.read_bytes()).hexdigest()
+        self._verify_md5(lf, local_md5, result)
 
-        if self._config.verify_checksum:
-            local_md5 = hashlib.md5(lf.path.read_bytes()).hexdigest()
-            if result.md5_checksum and local_md5 != result.md5_checksum:
-                logger.error(
-                    "MD5 mismatch for %s: local=%s drive=%s",
-                    lf.relative_path, local_md5, result.md5_checksum,
-                )
-                self._drive.trash_file(result.file_id)
-                raise DriveApiError(0, f"MD5 mismatch: {lf.relative_path}")
-
-        self._stats.files_uploaded += 1
-        self._stats.bytes_uploaded += lf.size
         self._session_cache.remove(lf.relative_path)
         logger.info("Uploaded: %s", lf.relative_path)
-        return True
+        return _WorkerResult(success=True, bytes_uploaded=lf.size)
 
     # ------------------------------------------------------------------
     # Resumable upload
     # ------------------------------------------------------------------
 
-    def _upload_resumable(
-        self, lf: LocalFile, parent_id: str, attempt: int
-    ) -> bool:
+    def _upload_resumable(self, lf: LocalFile, parent_id: str) -> _WorkerResult:
         """Upload a file > 8 MiB using the resumable upload protocol."""
-        session_uri: str | None = None
-        resume_offset = 0
-        resumed = False
+        session_uri, resume_offset, resumed = self._try_resume(lf)
 
-        # Try to resume from session cache.
-        cached = self._session_cache.get(lf.relative_path)
-        if cached is not None:
-            if cached.file_size == lf.size and cached.mtime == lf.mtime:
-                try:
-                    confirmed = self._drive.query_upload_status(
-                        cached.session_uri, lf.size
-                    )
-                    if confirmed == lf.size:
-                        # Already completed (e.g. from another machine).
-                        logger.info(
-                            "Session already completed: %s", lf.relative_path
-                        )
-                        self._session_cache.remove(lf.relative_path)
-                        self._stats.files_uploaded += 1
-                        self._stats.bytes_uploaded += lf.size
-                        self._stats.files_resumed += 1
-                        return True
-                    session_uri = cached.session_uri
-                    resume_offset = confirmed
-                    resumed = True
-                    logger.info(
-                        "Resuming %s from byte %d / %d",
-                        lf.relative_path, resume_offset, lf.size,
-                    )
-                except DriveApiError:
-                    logger.info(
-                        "Stale session for %s (expired or invalid), starting fresh",
-                        lf.relative_path,
-                    )
-            else:
-                logger.warning(
-                    "Discarding stale session for %s (file changed)",
-                    lf.relative_path,
-                )
-            if session_uri is None:
-                self._session_cache.remove(lf.relative_path)
+        # Session was already completed elsewhere -- no bytes transferred this run.
+        if resume_offset == lf.size:
+            return _WorkerResult(success=True, bytes_uploaded=0, resumed=True)
 
-        # Initiate a new session if needed.
         if session_uri is None:
             session_uri = self._drive.initiate_resumable_upload(
                 name=lf.path.name,
@@ -355,21 +406,17 @@ class Uploader:
             )
             self._session_cache.put(
                 lf.relative_path,
-                SessionEntry(
-                    session_uri=session_uri,
-                    file_size=lf.size,
-                    mtime=lf.mtime,
-                ),
+                SessionEntry(session_uri=session_uri, file_size=lf.size, mtime=lf.mtime),
             )
 
         # Stream chunks while computing MD5.
         hasher = hashlib.md5()
         chunk_size = self._config.chunk_size
         offset = 0
-        result: UploadResponse | None = None
+        resp: UploadResponse | None = None
 
         with open(lf.path, "rb") as f:
-            # Hash the already-uploaded portion (for MD5 continuity).
+            # Hash the already-uploaded portion for MD5 continuity.
             if resume_offset > 0:
                 remaining = resume_offset
                 while remaining > 0:
@@ -380,79 +427,91 @@ class Uploader:
                     remaining -= len(block)
                 offset = resume_offset
 
-            # Upload remaining chunks.
             while offset < lf.size:
                 data = f.read(chunk_size)
                 if not data:
                     break
                 hasher.update(data)
 
-                result = self._drive.upload_chunk(
-                    session_uri=session_uri,
-                    data=data,
-                    start=offset,
-                    total=lf.size,
+                chunk_start = time.monotonic()
+                resp = self._drive.upload_chunk(
+                    session_uri=session_uri, data=data, start=offset, total=lf.size,
                 )
                 offset += len(data)
 
-                # Bandwidth throttling.
                 if self._config.bwlimit:
+                    elapsed = time.monotonic() - chunk_start
                     expected = len(data) / self._config.bwlimit
-                    time.sleep(max(0, expected - 0.001))
+                    if elapsed < expected:
+                        time.sleep(expected - elapsed)
 
-                if not self._config.quiet and offset < lf.size:
-                    pct = offset * 100 / lf.size
-                    logger.debug(
-                        "%s: %.1f%% (%d / %d bytes)",
-                        lf.relative_path, pct, offset, lf.size,
-                    )
+        if resp is None:
+            raise DriveApiError(
+                500, f"Upload produced no completion response: {lf.relative_path}"
+            )
 
-        if result is None:
-            raise DriveApiError(0, f"Upload produced no completion response: {lf.relative_path}")
-
-        # Verify MD5.
         local_md5 = hasher.hexdigest()
-        if self._config.verify_checksum and result.md5_checksum:
-            if local_md5 != result.md5_checksum:
-                logger.error(
-                    "MD5 mismatch for %s: local=%s drive=%s",
-                    lf.relative_path, local_md5, result.md5_checksum,
-                )
-                self._drive.trash_file(result.file_id)
-                raise DriveApiError(0, f"MD5 mismatch: {lf.relative_path}")
+        self._verify_md5(lf, local_md5, resp)
 
-        # Success.
         self._session_cache.remove(lf.relative_path)
-        self._stats.files_uploaded += 1
-        self._stats.bytes_uploaded += lf.size
-        if resumed:
-            self._stats.files_resumed += 1
         logger.info("Uploaded: %s (%s)", lf.relative_path, local_md5)
-        return True
+        return _WorkerResult(success=True, bytes_uploaded=lf.size, resumed=resumed)
+
+    def _try_resume(self, lf: LocalFile) -> tuple[str | None, int, bool]:
+        """Check the session cache for a resumable session.
+
+        Returns ``(session_uri, confirmed_bytes, resumed)``.  If the upload
+        was already completed (e.g. from another machine), returns
+        ``(None, file_size, True)`` so the caller can return immediately.
+        """
+        cached = self._session_cache.get(lf.relative_path)
+        if cached is None:
+            return None, 0, False
+
+        if cached.file_size != lf.size or cached.mtime != lf.mtime:
+            logger.warning("Discarding stale session for %s (file changed)", lf.relative_path)
+            self._session_cache.remove(lf.relative_path)
+            return None, 0, False
+
+        try:
+            confirmed = self._drive.query_upload_status(cached.session_uri, lf.size)
+        except DriveApiError:
+            logger.info("Stale session for %s (expired or invalid), starting fresh", lf.relative_path)
+            self._session_cache.remove(lf.relative_path)
+            return None, 0, False
+
+        if confirmed == lf.size:
+            logger.info("Session already completed: %s", lf.relative_path)
+            self._session_cache.remove(lf.relative_path)
+            return None, lf.size, True  # signal: already done
+
+        logger.info("Resuming %s from byte %d / %d", lf.relative_path, confirmed, lf.size)
+        return cached.session_uri, confirmed, True
 
     # ------------------------------------------------------------------
-    # Folder management
+    # Folder management (thread-safe)
     # ------------------------------------------------------------------
 
     def _ensure_parent_folder(self, relative_path: str) -> str:
-        """Create parent folders on Drive if they don't exist.
+        """Return the Drive folder ID for the immediate parent.
 
-        Returns the Drive folder ID for the immediate parent of *relative_path*.
+        Creates missing folders on Drive.  Thread-safe via ``_folder_lock``.
         """
-        parts = relative_path.split("/")[:-1]  # drop filename
+        parts = relative_path.split("/")[:-1]
         if not parts:
             return self._config.drive_folder_id
 
         current_path = ""
         parent_id = self._config.drive_folder_id
 
-        for part in parts:
-            current_path = f"{current_path}{part}/" if current_path else f"{part}/"
-            if current_path in self._folder_map:
-                parent_id = self._folder_map[current_path]
-            else:
-                parent_id = self._drive.create_folder(part, parent_id)
-                self._folder_map[current_path] = parent_id
-                logger.info("Created folder: %s", current_path)
+        with self._folder_lock:
+            for part in parts:
+                current_path = f"{current_path}{part}/" if current_path else f"{part}/"
+                if current_path in self._folder_map:
+                    parent_id = self._folder_map[current_path]
+                else:
+                    parent_id = self._drive.create_folder(part, parent_id)
+                    self._folder_map[current_path] = parent_id
+                    logger.info("Created folder: %s", current_path)
 
         return parent_id

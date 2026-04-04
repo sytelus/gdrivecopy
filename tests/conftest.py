@@ -145,7 +145,6 @@ def upload_config(tmp_path: Path, source_tree: Path) -> UploadConfig:
         token_path=tmp_path / "token.json",
         session_path=tmp_path / "sessions.json",
         verify_checksum=True,
-        wait_on_limit=False,
         quiet=True,
         log_dir=tmp_path,
         log_level="DEBUG",

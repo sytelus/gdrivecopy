@@ -44,10 +44,8 @@ Create a reliable, robust, and fast command-line utility to upload very large am
 
 ### 4.1 Dependencies
 
-- `google-api-python-client`, `google-auth-oauthlib`, `google-auth` -- Drive API v3 + OAuth
-- `aiohttp` or `httpx[http2]` -- async HTTP for concurrent chunked uploads
-- `rich` -- terminal progress (optional)
-- stdlib: `hashlib`, `asyncio`, `pathlib`, `logging`, `json`
+- `google-api-python-client`, `google-auth-oauthlib`, `google-auth` -- Drive API v3, OAuth, and ``AuthorizedSession`` for chunked uploads
+- stdlib: `hashlib`, `concurrent.futures`, `pathlib`, `logging`, `json`
 
 ### 4.2 Workflow
 
@@ -140,7 +138,7 @@ If valid: resume from the confirmed offset. Otherwise: discard the entry, log th
 ```
 Main Process
   ├── Drive Scanner (lists target folder, builds in-memory map)
-  ├── Upload Pool (asyncio event loop, N concurrent uploads, default 4)
+  ├── Upload Pool (ThreadPoolExecutor, N concurrent uploads, default 4)
   └── MD5 computed per-file during upload (streaming, 8 KiB blocks)
 ```
 
@@ -161,8 +159,8 @@ gdrivecopy upload <source_dir> <drive_folder_id> [options]
   --log-level LEVEL      Log verbosity (default: INFO)
   --credentials PATH     OAuth credentials JSON (default: ./credentials.json)
   --token PATH           OAuth token cache (default: ./token.json)
+  --sessions PATH        Session cache file (default: ./sessions.json)
   --no-checksum-verify   Skip post-upload MD5 verification
-  --wait-on-limit        Wait and auto-resume when daily limit is hit (default: exit)
   --quiet                Minimal output
 
 gdrivecopy auth [--credentials]  Run OAuth flow and cache token
@@ -215,23 +213,21 @@ Daily limit hit: 3 times
 
 ### Phase 1: MVP
 - OAuth 2.0 auth flow
-- Drive folder listing (recursive, builds in-memory map)
+- Drive folder listing (recursive, builds in-memory map, with retry on transient errors)
 - Filesystem scanner with skip detection (path + size, size mismatch warnings)
 - Folder creation on Drive
 - Single-file resumable upload with optional session cache (`sessions.json`) for byte-level resume
 - Metadata preservation (`createdTime`, `modifiedTime`)
 - Post-upload MD5 verification
-- Basic error handling with retries
+- Error handling with retries, circuit breaker
+- `--dry-run` mode
 - Logging and summary report
 
 ### Phase 2: Performance
-- Concurrent async uploads
-- Circuit breaker
+- Concurrent uploads (bounded `ThreadPoolExecutor`)
 - Progress display
 - `--bwlimit`
 
 ### Phase 3: Polish
-- `--dry-run` mode
 - `--exclude` / `--include` glob patterns
-- JSON report generation
 - Graceful shutdown on Ctrl+C

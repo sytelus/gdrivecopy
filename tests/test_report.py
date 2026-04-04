@@ -181,6 +181,7 @@ class TestSaveReportJson:
         data = json.loads(path.read_text(encoding="utf-8"))
         expected_keys = {
             "files_scanned",
+            "symlinks_skipped",
             "files_uploaded",
             "bytes_uploaded",
             "files_resumed",

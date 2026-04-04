@@ -40,7 +40,7 @@ class SessionCache:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._data: dict[str, SessionEntry] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # reentrant so put/remove can call save
 
     # ------------------------------------------------------------------
     # Persistence
@@ -97,13 +97,13 @@ class SessionCache:
         """Insert or update a session entry and persist to disk."""
         with self._lock:
             self._data[relative_path] = entry
-        self.save()
+            self.save()
 
     def remove(self, relative_path: str) -> None:
         """Remove a session entry (if present) and persist to disk."""
         with self._lock:
             self._data.pop(relative_path, None)
-        self.save()
+            self.save()
 
     def __len__(self) -> int:
         with self._lock:

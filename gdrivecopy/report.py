@@ -49,6 +49,7 @@ def format_report(stats: UploadStats) -> str:
         f"  Files uploaded:     {stats.files_uploaded:>10,}  ({_fmt_bytes(stats.bytes_uploaded)})",
         f"  Files resumed:      {stats.files_resumed:>10,}",
         f"  Files skipped:      {stats.files_skipped:>10,}  (already on Drive)",
+        f"  Symlinks skipped:   {stats.symlinks_skipped:>10,}",
         f"  Size mismatches:    {stats.size_mismatches:>10,}  (see log for details)",
         f"  Files failed:       {stats.files_failed:>10,}",
         f"  Duration:           {_fmt_duration(stats.duration_seconds):>10}",
@@ -78,6 +79,7 @@ def save_report_json(stats: UploadStats, path: Path) -> None:
     """Write the report as a JSON file."""
     data = {
         "files_scanned": stats.files_scanned,
+        "symlinks_skipped": stats.symlinks_skipped,
         "files_uploaded": stats.files_uploaded,
         "bytes_uploaded": stats.bytes_uploaded,
         "files_resumed": stats.files_resumed,

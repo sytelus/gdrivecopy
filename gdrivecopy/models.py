@@ -65,7 +65,6 @@ class UploadConfig:
     token_path: Path = field(default_factory=lambda: Path("token.json"))
     session_path: Path = field(default_factory=lambda: Path("sessions.json"))
     verify_checksum: bool = True
-    wait_on_limit: bool = False
     quiet: bool = False
     log_dir: Path = field(default_factory=lambda: Path("."))
     log_level: str = "INFO"
@@ -75,11 +74,12 @@ class UploadConfig:
 class UploadStats:
     """Mutable counters collected during an upload run.
 
-    All fields are plain integers/lists so they can be updated safely from the
-    main thread (the ``Uploader`` serialises result handling).
+    Updated only from the main thread in ``Uploader._upload_all`` after
+    each worker future completes.
     """
 
     files_scanned: int = 0
+    symlinks_skipped: int = 0
     files_uploaded: int = 0
     bytes_uploaded: int = 0
     files_resumed: int = 0

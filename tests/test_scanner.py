@@ -36,13 +36,13 @@ class TestIsoFromTimestamp:
 
 class TestScanLocalRegularFiles:
     def test_finds_all_regular_files(self, source_tree: Path) -> None:
-        """scan_local yields one LocalFile per regular file in the tree."""
-        files = list(scan_local(source_tree))
-        assert len(files) == 3
+        """scan_local returns one LocalFile per regular file in the tree."""
+        result = scan_local(source_tree)
+        assert len(result.files) == 3
 
     def test_relative_paths_use_forward_slash(self, source_tree: Path) -> None:
         """Relative paths always use '/' regardless of OS."""
-        files = list(scan_local(source_tree))
+        files = scan_local(source_tree).files
         rel_paths = {f.relative_path for f in files}
         assert "file_a.txt" in rel_paths
         assert "subdir/file_b.bin" in rel_paths
@@ -50,29 +50,26 @@ class TestScanLocalRegularFiles:
 
     def test_file_sizes_are_correct(self, source_tree: Path) -> None:
         """Each LocalFile records the correct byte size."""
-        files = {f.relative_path: f for f in scan_local(source_tree)}
-        assert files["file_a.txt"].size == 11
-        assert files["subdir/file_b.bin"].size == 5
-        assert files["subdir/nested/file_c.dat"].size == 3
+        by_path = {f.relative_path: f for f in scan_local(source_tree).files}
+        assert by_path["file_a.txt"].size == 11
+        assert by_path["subdir/file_b.bin"].size == 5
+        assert by_path["subdir/nested/file_c.dat"].size == 3
 
     def test_paths_are_absolute(self, source_tree: Path) -> None:
         """The `path` attribute is an absolute path to the real file."""
-        files = list(scan_local(source_tree))
-        for f in files:
+        for f in scan_local(source_tree).files:
             assert f.path.is_absolute()
             assert f.path.exists()
 
     def test_mtime_is_set(self, source_tree: Path) -> None:
         """mtime is a non-empty ISO 8601 string."""
-        files = list(scan_local(source_tree))
-        for f in files:
+        for f in scan_local(source_tree).files:
             assert f.mtime
-            assert "T" in f.mtime  # basic ISO check
+            assert "T" in f.mtime
 
     def test_ctime_is_set(self, source_tree: Path) -> None:
         """ctime is a non-empty ISO 8601 string."""
-        files = list(scan_local(source_tree))
-        for f in files:
+        for f in scan_local(source_tree).files:
             assert f.ctime is not None
             assert "T" in f.ctime
 
@@ -90,8 +87,7 @@ class TestScanLocalSortOrder:
         for name in ["z.txt", "a.txt", "m.txt"]:
             (root / name).write_text("x")
 
-        files = list(scan_local(root))
-        names = [f.relative_path for f in files]
+        names = [f.relative_path for f in scan_local(root).files]
         assert names == ["a.txt", "m.txt", "z.txt"]
 
     def test_directories_are_traversed_in_sorted_order(self, tmp_path: Path) -> None:
@@ -103,8 +99,7 @@ class TestScanLocalSortOrder:
             sub.mkdir()
             (sub / "file.txt").write_text("x")
 
-        files = list(scan_local(root))
-        dirs = [f.relative_path.split("/")[0] for f in files]
+        dirs = [f.relative_path.split("/")[0] for f in scan_local(root).files]
         assert dirs == ["a_dir", "m_dir", "z_dir"]
 
 
@@ -116,9 +111,10 @@ class TestScanLocalSortOrder:
 class TestScanLocalSymlinks:
     def test_symlinks_are_skipped(self, source_tree_with_symlink: Path) -> None:
         """Symlinks must not appear in the scan output."""
-        files = list(scan_local(source_tree_with_symlink))
-        rel_paths = {f.relative_path for f in files}
+        result = scan_local(source_tree_with_symlink)
+        rel_paths = {f.relative_path for f in result.files}
         assert "link_to_a.txt" not in rel_paths
+        assert result.symlinks_skipped == 1
 
     def test_symlink_logs_warning(
         self, source_tree_with_symlink: Path, caplog: pytest.LogCaptureFixture
@@ -127,7 +123,7 @@ class TestScanLocalSymlinks:
         import logging
 
         with caplog.at_level(logging.WARNING, logger="gdrivecopy.scanner"):
-            list(scan_local(source_tree_with_symlink))
+            scan_local(source_tree_with_symlink)
         assert any("Skipping symlink" in m for m in caplog.messages)
 
 
@@ -147,16 +143,13 @@ class TestScanLocalStatErrors:
         original_stat = Path.stat
 
         def _patched_stat(self_: Path, *args: object, **kwargs: object) -> os.stat_result:
-            # Only fail on the explicit stat() call (follow_symlinks=True, the
-            # default).  is_symlink() calls stat(follow_symlinks=False) which
-            # must be allowed through so the scanner can reach the stat() path.
             follow = kwargs.get("follow_symlinks", True)
             if self_.name == "bad.txt" and follow:
                 raise OSError("permission denied")
             return original_stat(self_, *args, **kwargs)
 
         with patch.object(Path, "stat", _patched_stat):
-            files = list(scan_local(root))
+            files = scan_local(root).files
 
         names = [f.relative_path for f in files]
         assert "good.txt" in names
@@ -184,7 +177,7 @@ class TestScanLocalStatErrors:
             patch.object(Path, "stat", _patched_stat),
             caplog.at_level(logging.ERROR, logger="gdrivecopy.scanner"),
         ):
-            list(scan_local(root))
+            scan_local(root)
 
         assert any("Cannot stat" in m for m in caplog.messages)
 
@@ -199,4 +192,6 @@ class TestScanLocalEmpty:
         """An empty source directory produces zero results."""
         root = tmp_path / "empty"
         root.mkdir()
-        assert list(scan_local(root)) == []
+        result = scan_local(root)
+        assert result.files == []
+        assert result.symlinks_skipped == 0
