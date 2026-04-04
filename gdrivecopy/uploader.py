@@ -28,6 +28,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 
+import requests.exceptions
+
 from google.auth.transport.requests import Request
 from googleapiclient.errors import HttpError
 
@@ -305,16 +307,20 @@ class Uploader:
             except ChecksumError as exc:
                 # MD5 mismatch -- always retry (file was trashed, re-upload).
                 self._backoff(lf, attempt, exc)
-            except ConnectionError as exc:
-                # Network failure (e.g. requests.ConnectionError, which is a
-                # subclass of builtins.ConnectionError -> OSError).  Must be
-                # caught before the OSError handler to avoid treating network
-                # blips as permanent local-read failures.
-                self._backoff(lf, attempt, exc)
             except OSError as exc:
-                # Genuine local I/O error (disk read failure, permission denied).
-                logger.error("Local read error: %s -- %s", lf.relative_path, exc)
-                return _WorkerResult(success=False, error=str(exc), is_permanent=True)
+                # requests.ConnectionError is a subclass of OSError (not
+                # builtins.ConnectionError), so network failures land here.
+                # Distinguish network errors (retryable) from local I/O
+                # errors (permanent).
+                if isinstance(exc, requests.exceptions.ConnectionError):
+                    self._backoff(lf, attempt, exc)
+                else:
+                    logger.error(
+                        "Local read error: %s -- %s", lf.relative_path, exc
+                    )
+                    return _WorkerResult(
+                        success=False, error=str(exc), is_permanent=True
+                    )
 
         logger.error("Max retries exceeded: %s", lf.relative_path)
         return _WorkerResult(success=False, error="max retries exceeded")
