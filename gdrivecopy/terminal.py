@@ -166,6 +166,12 @@ def render_report(report: dict, console: Console | None = None) -> None:
                 Text(
                     f"This run: {size(report['bytes_this_run'])} transferred · {duration(report['duration_seconds'])}"
                 ),
+                Text(
+                    f"Scan issues: {report.get('scan_errors', 0):,} · "
+                    f"Links skipped: {report.get('symlinks_skipped', 0):,} · "
+                    f"Tool entries excluded: {report.get('tool_entries_excluded', 0):,}"
+                ),
+                *(Text(error, style="red") for error in report.get("scan_errors_sample", [])[:5]),
                 *(
                     Text(report["stop_reason"], style="yellow")
                     for _ in [0]

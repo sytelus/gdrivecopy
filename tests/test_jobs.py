@@ -128,6 +128,26 @@ def test_unexpected_upload_identity_is_not_accepted(job):
     store.close()
 
 
+def test_completed_upload_edited_before_resume_is_never_trashed(job):
+    store, config, local = job("upload")
+    (local / "file").write_bytes(b"original")
+    drive = FakeDrive()
+    assert TransferRunner(store, drive, config).run()["status"] == "complete"
+    identity = store.file("file")["remote_id"]
+    drive.add_file("file", b"modified", identity=identity)
+    uploads = drive.upload_calls
+    with patch.object(drive, "trash_file") as trash:
+        report = TransferRunner(store, drive, config).run()
+        assert TransferRunner(store, drive, config).run()["status"] == "incomplete"
+    assert report["status"] == "incomplete"
+    assert report["counts"]["conflict"]["files"] == 1
+    assert "content changed" in store.file("file")["error"]
+    assert drive.content[identity] == b"modified"
+    assert drive.upload_calls == uploads
+    trash.assert_not_called()
+    store.close()
+
+
 def test_resumable_upload_survives_new_runner_and_database_connection(job):
     store, config, local = job("upload")
     (local / "large.bin").write_bytes(b"x" * (8 * 1024 * 1024 + 1))
@@ -351,6 +371,30 @@ def test_state_and_client_credentials_are_excluded(job):
     store.close()
 
 
+def test_scan_errors_are_in_summary_and_human_report(job):
+    import io
+
+    from rich.console import Console
+
+    from gdrivecopy.terminal import render_report
+
+    store, config, local = job("upload")
+
+    def denied_walk(root, *, followlinks, onerror):
+        onerror(PermissionError(13, "permission denied", str(local / "unreadable")))
+        return iter(())
+
+    with patch("gdrivecopy.scanner.os.walk", denied_walk):
+        report = TransferRunner(store, FakeDrive(), config).run()
+    assert report["status"] == "incomplete"
+    assert report["scan_errors"] == 1
+    assert "unreadable" in report["scan_errors_sample"][0]
+    output = io.StringIO()
+    render_report(report, Console(file=output, width=120))
+    assert "permission denied" in output.getvalue()
+    store.close()
+
+
 def test_disk_sync_failure_never_advances_checkpoint_or_publishes(job):
     store, config, local = job()
     drive = FakeDrive()
@@ -394,6 +438,89 @@ def test_same_size_skip_is_not_reported_as_verified_copy(job):
     report = TransferRunner(store, drive, config).run()
     assert report["counts"] == {"skipped_size": {"files": 1, "bytes": 5}}
     assert drive.download_calls == []
+    # A missing receipt was historically saved as the string 'null'. Reusing
+    # the job must preserve the requested fast comparison and avoid disk reads.
+    store.update_file("same.txt", proof="null")
+    with patch("gdrivecopy.transfer.hashlib.md5", side_effect=AssertionError("unexpected hash")):
+        resumed = TransferRunner(store, drive, config).run()
+    assert resumed["counts"] == report["counts"]
+    assert resumed["status"] == "complete"
+    store.close()
+
+
+@pytest.mark.parametrize("protocol", ["multipart", "resumable"])
+@pytest.mark.parametrize("changed_source", [False, True])
+def test_wrong_upload_identity_never_trashes_unrelated_file(job, protocol, changed_source):
+    from gdrivecopy.drive import UploadResponse
+
+    store, config, local = job("upload")
+    source = local / "payload"
+    source.write_bytes(b"x" * (8 * 1024 * 1024 + 1) if protocol == "resumable" else b"data")
+    drive = FakeDrive()
+    unrelated = drive.add_file("unrelated", b"must survive")
+    method = "upload_chunk" if protocol == "resumable" else "multipart_upload"
+    original = getattr(drive, method)
+
+    def wrong_response(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if response is not None:
+            if changed_source:
+                source.write_bytes(b"changed")
+            return UploadResponse(unrelated, None)
+        return response
+
+    with patch.object(drive, method, wrong_response), patch.object(drive, "trash_file") as trash:
+        report = TransferRunner(store, drive, config).run()
+    assert report["status"] == "incomplete"
+    assert "different upload identity" in store.file("payload")["error"]
+    trash.assert_not_called()
+    store.close()
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+def test_interrupted_manifest_is_rebuilt_without_obsolete_rows(job, direction):
+    store, config, local = job(direction)
+    drive = FakeDrive()
+    if direction == "upload":
+        (local / "current").write_bytes(b"current")
+    else:
+        drive.add_file("current", b"current")
+    # Simulate a crash after a planning batch, before plan_complete. No copy
+    # has started, so obsolete entries and collision decisions are disposable.
+    store.add_files([("obsolete", {}, 99)])
+    with store.transaction() as db:
+        db.execute("CREATE TABLE targets(name TEXT PRIMARY KEY,path TEXT NOT NULL)")
+        db.execute("INSERT INTO targets VALUES('current','obsolete')")
+    report = TransferRunner(store, drive, config).run()
+    assert report["status"] == "complete"
+    assert report["counts"] == {"copied": {"files": 1, "bytes": 7}}
+    assert store.file("obsolete") is None
+    store.close()
+
+
+def test_receipt_rehash_updates_mtime_for_subsequent_fast_resume(job):
+    store, config, local = job()
+    drive = FakeDrive()
+    drive.add_file("file", b"payload")
+    TransferRunner(store, drive, config).run()
+    target = local / "file"
+    stamp = target.stat().st_mtime_ns + 10_000_000_000
+    os.utime(target, ns=(stamp, stamp))
+    assert TransferRunner(store, drive, config).run()["status"] == "complete"
+    with patch("gdrivecopy.transfer.hashlib.md5", side_effect=AssertionError("unexpected hash")):
+        assert TransferRunner(store, drive, config).run()["status"] == "complete"
+    assert len(drive.download_calls) == 1
+    store.close()
+
+
+@pytest.mark.parametrize("name", ["COM¹.txt", "LPT².txt", "com³", ".GDRIVECOPY-user.parts"])
+def test_reserved_windows_and_internal_names_are_blocked_before_download(job, name):
+    store, config, _local = job()
+    drive = FakeDrive()
+    drive.add_file(name, b"payload")
+    report = TransferRunner(store, drive, config).run()
+    assert report["counts"]["conflict"]["files"] == 1
+    assert not drive.download_calls
     store.close()
 
 
@@ -474,6 +601,19 @@ def test_download_rate_limit_retries_and_quota_pauses(job):
     assert report["status"] == "paused"
     assert report["counts"]["pending"]["files"] == 1
     drive.download_range = original
+    assert TransferRunner(store, drive, config).run()["status"] == "complete"
+    store.close()
+
+
+def test_inventory_quota_pauses_before_payload_and_can_resume(job):
+    store, config, _local = job()
+    drive = FakeDrive()
+    drive.add_file("file", b"payload")
+    with patch.object(drive, "folder_page", side_effect=QuotaLimitError(403, "daily quota")):
+        report = TransferRunner(store, drive, config).run()
+    assert report["status"] == "paused"
+    assert "quota" in report["stop_reason"]
+    assert not drive.download_calls
     assert TransferRunner(store, drive, config).run()["status"] == "complete"
     store.close()
 

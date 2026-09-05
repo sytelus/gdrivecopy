@@ -9,6 +9,7 @@ import re
 import signal
 import sqlite3
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -20,8 +21,9 @@ from rich.text import Text
 from gdrivecopy.accounts import Accounts, default_state_dir
 from gdrivecopy.drive import DriveClient
 from gdrivecopy.jobstore import JobLock, JobStore, utc_now
+from gdrivecopy.redaction import protect_logs, safe_error
 from gdrivecopy.terminal import Dashboard, render_report
-from gdrivecopy.transfer import TransferRunner, build_report, safe_error
+from gdrivecopy.transfer import TransferRunner, build_report
 
 JOB_PATTERN = re.compile(r"^\d{8}-\d{6}-[a-f0-9]{8}$")
 
@@ -210,32 +212,21 @@ def job_directory(state: Path, identifier: str) -> Path:
     return directory
 
 
-class RedactedLog(logging.Filter):
-    def filter(self, record):
-        record.msg = safe_error(record.getMessage())
-        record.args = ()
-        return True
-
-
 def configure_logging(directory: Path, args, dashboard: bool) -> None:
     handler = RotatingFileHandler(
         directory / "run.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
-    handler.addFilter(RedactedLog())
     handlers = [handler]
     if not dashboard and not args.quiet:
         plain = logging.StreamHandler()
-        plain.addFilter(RedactedLog())
         handlers.append(plain)
+    protect_logs(handlers)
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=handlers,
         force=True,
     )
-    # OAuth debug output can contain token material before our code receives it.
-    for name in ("google.auth", "google_auth_oauthlib", "oauthlib", "requests_oauthlib", "urllib3"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def execute(args) -> int:
@@ -267,15 +258,26 @@ def execute(args) -> int:
         return 0
     if args.command == "jobs":
         table = Table("Job", "Status", "Direction", "Account")
+        failed = False
         for path in sorted((state / "jobs").glob("*/job.sqlite3"), reverse=True):
-            with sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True) as db:
-                values = {
-                    key: json.loads(value)
-                    for key, value in db.execute(
-                        "SELECT key,value FROM meta WHERE key IN ('config','status')"
-                    )
-                }
-            config = values.get("config", {})
+            try:
+                # SQLite's own context manager commits/rolls back; it does not
+                # close the connection. Explicit closure avoids leaked handles.
+                with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as db:
+                    values = {
+                        key: json.loads(value)
+                        for key, value in db.execute(
+                            "SELECT key,value FROM meta WHERE key IN ('config','status')"
+                        )
+                    }
+                config = values.get("config", {})
+                if not isinstance(config, dict) or not isinstance(values.get("status", "new"), str):
+                    raise ValueError("Invalid job summary")
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                failed = True
+                table.add_row(Text(path.parent.name), "Unreadable", "", "")
+                Console(stderr=True).print(Text(f"{path.parent.name}: {safe_error(exc)}"))
+                continue
             table.add_row(
                 path.parent.name,
                 values.get("status", "new"),
@@ -283,7 +285,7 @@ def execute(args) -> int:
                 Text(config.get("account_email", "")),
             )
         Console().print(table)
-        return 0
+        return 1 if failed else 0
     if args.command == "report":
         directory = job_directory(state, args.job_id)
         store = JobStore(directory, readonly=True)
@@ -308,6 +310,7 @@ def execute(args) -> int:
                 name, identity, drive = Accounts(state).connect(args.account or config["account"])
                 if identity["id"] != config["account_id"]:
                     raise ValueError("The selected Google account does not own this job")
+                config.update(account=name, account_email=identity["email"], state_dir=str(state))
                 config["dry_run"] = args.dry_run
                 if args.transfers:
                     config["transfers"] = args.transfers

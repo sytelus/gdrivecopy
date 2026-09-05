@@ -42,6 +42,9 @@ fields but are diagnostic, not tamper-evident.
 | Missing/short partial | Restart that file from zero; retain completed verified files. |
 | Expired upload session | Recover a completed reserved ID or start a fresh session; discarded server prefixes may need retransmission. |
 | Expired listing cursor | Rescan that folder; an expired change cursor requires rebuilding inventory. |
+| Interrupted manifest build | Rebuild the unfinished source plan before transferring; finished plans remain fixed. |
+| Moved/trashed folder created by this job | Stop and review the Drive destination; recovery refuses to reuse a folder at the wrong location. |
+| Completed upload edited on Drive | Report a conflict and preserve the edited item; a previous receipt is not permission to trash later changes. |
 | Existing destination conflict | Review/move the item yourself, then resume. Static namespace collisions need fixed Drive names and a new job. |
 | Changed source/new files | Start a new copy job; resume retains the original manifest. |
 | Suspected later disk corruption | Start a new download job with `--existing checksum`; mismatches are reported without overwrite. |
@@ -53,7 +56,8 @@ timing/report updates and require checking or retransmitting uncheckpointed byte
 
 ## Reading reports
 
-`report.json` summarizes an ended run; `files.csv` covers source path, target,
+`report.json` summarizes an ended run, including source scan error counts and a
+bounded `scan_errors_sample`; `files.csv` covers source path, target,
 logical size, status and error. Both are atomically replaced. After an abrupt
 crash, `report JOB_ID` reads current database state. During a running job, counts
 can change between queries and last-run timing fields are not live counters.

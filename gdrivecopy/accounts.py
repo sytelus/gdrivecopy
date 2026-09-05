@@ -12,6 +12,8 @@ from gdrivecopy.drive import DriveClient
 from gdrivecopy.jobstore import JobLock
 from gdrivecopy.persistence import write_text_atomic
 
+PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
 
 def default_state_dir() -> Path:
     if os.name == "nt":
@@ -34,10 +36,30 @@ class Accounts:
             raise ValueError(
                 "Invalid account registry; restore accounts.json from a trusted backup"
             )
+        names = set()
+        for name, profile in data["profiles"].items():
+            if (
+                not PROFILE_NAME.fullmatch(name)
+                or name.casefold() in names
+                or not isinstance(profile, dict)
+                or any(
+                    not isinstance(profile.get(key), str) or not profile[key]
+                    for key in ("id", "email", "credentials")
+                )
+            ):
+                raise ValueError(
+                    "Invalid account profile; restore accounts.json from a trusted backup"
+                )
+            names.add(name.casefold())
+        default = data.setdefault("default", None)
+        if default is not None and (
+            not isinstance(default, str) or default not in data["profiles"]
+        ):
+            raise ValueError("Invalid default account; restore accounts.json from a trusted backup")
         return data
 
     def add(self, name: str, credentials_path: Path) -> dict:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+        if not PROFILE_NAME.fullmatch(name):
             raise ValueError(
                 "Account names use letters, digits, '-' and '_' (maximum 64 characters)"
             )

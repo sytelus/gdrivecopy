@@ -30,17 +30,6 @@ Run `gdrivecopy doctor` to check bundled dependencies and local persistence
 without signing in or sending a Google request. `doctor --json` is useful in
 bug reports. It does not test live credentials, permissions or transfers.
 
-A fast terminal app for copying folder trees **to and from Google Drive**, with
-concurrent transfers, a live dashboard, checksum verification, and durable jobs
-that continue after cancellation, a crash, or a reboot.
-
-```powershell
-gdrivecopy accounts add personal --credentials "C:\Private\client.json"
-gdrivecopy copy "D:\Photos" drive:FOLDER_ID --account personal
-gdrivecopy copy drive:root "E:\Drive backup" --account personal
-gdrivecopy resume JOB_ID
-```
-
 The dashboard shows the actual account, active files, progress, transfer rate,
 elapsed time, ETA, retries, and recent errors. `--no-progress` uses plain logs;
 `--quiet` shows the final report only. Redirected output uses plain logs.
@@ -48,12 +37,15 @@ There is no browser interface or background service.
 
 ## Install and sign in
 
-Requires Python 3.10+, an enabled Google Drive API project, and a Desktop OAuth
-client JSON. This version supports **My Drive** folders; shared drives are rejected.
+Every installation needs an enabled Google Drive API project and a Desktop OAuth
+client JSON. Installing from source also needs Python 3.10+; native releases bundle
+Python. This version supports **My Drive** folders; shared drives are rejected.
 
 ```powershell
 git clone https://github.com/sytelus/gdrivecopy.git
 cd gdrivecopy
+python -m venv .venv
+# Activate: .venv\Scripts\Activate.ps1 on Windows; source .venv/bin/activate on Unix
 python -m pip install .
 gdrivecopy --help
 ```
@@ -84,7 +76,9 @@ gdrivecopy accounts use personal
 gdrivecopy copy drive:root "E:\Work backup" --account work
 ```
 
-A sole profile is selected automatically. With several profiles, choose
+A sole profile is selected automatically. Profile names use letters, digits,
+`-` and `_` (up to 64 characters); names differing only by case are rejected.
+With several profiles, choose
 `--account` or explicitly set a default. Drive verifies the email before every
 run. A saved job stays bound to the original Google user even if the default changes.
 
@@ -187,6 +181,9 @@ Default state is `%LOCALAPPDATA%\gdrivecopy` on Windows and
 Each job has `job.sqlite3`, `report.json`, `files.csv`, and rotating `run.log`
 files. SQLite holds the manifest, checkpoints, and append-only audit. JSON
 provides statistics, limitations and an error sample; CSV covers every file.
+Source scan failures also appear in the final summary and JSON; the audit retains
+their full messages. `jobs` still lists readable jobs if another database is damaged,
+marks the damaged job unreadable, and exits with code 1.
 Audit export uses JSON Lines and refuses to overwrite an existing file.
 
 Exit codes: **0** complete/successful dry-run, **1** incomplete/paused/error,
@@ -196,11 +193,15 @@ skips; read the outcome breakdown.
 ## Large migrations and limits
 
 SQLite manifests, batched scanning and bounded worker queues avoid keeping the
-entire transfer queue in memory. Resume reuses the original source manifest and
+entire transfer queue in memory. A manifest becomes fixed only after planning
+finishes; an interrupted build restarts its source scan before any payload moves.
+Resume reuses the finished source manifest and
 refreshes remote metadata through Drive's change feed. Completed downloads reuse
 size/mtime receipts. An incomplete verified file rereads its local prefix to
 reconstruct its hash, without retransferring confirmed bytes. Start a **new job**
 to include new files or rehash completed destinations with `--existing checksum`.
+Previously skipped files retain the selected existing-file comparison on resume:
+`size` checks metadata without rereading their contents; `checksum` hashes them again.
 
 Keep state on a reliable local disk. Plan capacity for destination content,
 partial files, metadata and audit. Parts occupy the eventual file's space, not

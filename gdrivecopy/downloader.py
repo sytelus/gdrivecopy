@@ -21,8 +21,9 @@ WINDOWS_RESERVED = {
     "PRN",
     "AUX",
     "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
+    # Win32 also recognizes superscript 1, 2 and 3 as device-number aliases.
+    *(f"COM{i}" for i in "123456789¹²³"),
+    *(f"LPT{i}" for i in "123456789¹²³"),
 }
 
 

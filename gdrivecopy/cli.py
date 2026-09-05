@@ -16,6 +16,7 @@ from pathlib import Path
 from gdrivecopy import __version__
 from gdrivecopy.commands import HelpParser, add_commands
 from gdrivecopy.models import UploadConfig
+from gdrivecopy.redaction import protect_logs, safe_error
 
 
 def _parse_size(value: str) -> int:
@@ -172,6 +173,7 @@ def _setup_logging(log_dir: Path, log_level: str, quiet: bool) -> Path:
     ]
     if not quiet:
         handlers.append(logging.StreamHandler(sys.stderr))
+    protect_logs(handlers)
 
     logging.basicConfig(
         level=getattr(logging, log_level),
@@ -193,8 +195,8 @@ def main(argv: list[str] | None = None) -> None:
     except OSError as exc:
         # Includes log setup, token persistence and final report failures,
         # which can happen outside the upload exception boundary below.
-        logging.getLogger(__name__).error("Filesystem operation failed: %s", exc)
-        print(f"gdrivecopy: filesystem operation failed: {exc}", file=sys.stderr)
+        logging.getLogger(__name__).error("Filesystem operation failed: %s", safe_error(exc))
+        print(f"gdrivecopy: filesystem operation failed: {safe_error(exc)}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -230,6 +232,7 @@ def _main(argv: list[str] | None = None) -> None:
 
         from google.auth.exceptions import GoogleAuthError
         from googleapiclient.errors import HttpError
+        from httplib2 import HttpLib2Error
         from requests.exceptions import RequestException
 
         from gdrivecopy.commands import execute
@@ -242,11 +245,12 @@ def _main(argv: list[str] | None = None) -> None:
             RuntimeError,
             GoogleAuthError,
             HttpError,
+            HttpLib2Error,
             DriveApiError,
             RequestException,
             SQLiteError,
         ) as exc:
-            print(f"gdrivecopy: {exc}", file=sys.stderr)
+            print(f"gdrivecopy: {safe_error(exc)}", file=sys.stderr)
             sys.exit(1)
         if code:
             sys.exit(code)
@@ -330,7 +334,7 @@ def _main(argv: list[str] | None = None) -> None:
         ) as exc:
             logging.getLogger(__name__).error("Upload aborted: %s", exc)
             if args.quiet:
-                print(f"gdrivecopy: upload aborted: {exc}", file=sys.stderr)
+                print(f"gdrivecopy: upload aborted: {safe_error(exc)}", file=sys.stderr)
             sys.exit(1)
 
         report_text = format_report(stats)

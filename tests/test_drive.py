@@ -308,12 +308,47 @@ class TestCreateFolder:
             OSError("response lost"),
             HttpError(Response({"status": "409"}), b'{"error":{"message":"exists"}}'),
         ]
+        svc.files().get().execute.return_value = {
+            "id": "new-folder-123",
+            "name": "photos",
+            "mimeType": FOLDER_MIME,
+            "parents": ["parent-id"],
+        }
         svc.files().create.reset_mock()
         with pytest.raises(DriveApiError):
             client.create_folder("photos", "parent-id")
         assert client.create_folder("photos", "parent-id") == "new-folder-123"
         bodies = [call.kwargs["body"] for call in svc.files().create.call_args_list]
         assert [body["id"] for body in bodies] == ["new-folder-123", "new-folder-123"]
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"parents": ["elsewhere"]},
+            {"name": "renamed"},
+            {"trashed": True},
+            {"mimeType": "text/plain"},
+            {"id": "unrelated"},
+        ],
+    )
+    def test_recovered_folder_must_still_match_destination(self, change):
+        from googleapiclient.errors import HttpError
+        from httplib2 import Response
+
+        client, svc, _ = _make_client()
+        svc.files().list().execute.return_value = {"files": []}
+        svc.files().create().execute.side_effect = HttpError(
+            Response({"status": "409"}), b'{"error":{"message":"exists"}}'
+        )
+        svc.files().get().execute.return_value = {
+            "id": "new-folder-123",
+            "name": "photos",
+            "mimeType": FOLDER_MIME,
+            "parents": ["parent-id"],
+            **change,
+        }
+        with pytest.raises(DrivePathConflictError, match="Previously created folder"):
+            client.create_folder("photos", "parent-id")
 
     def test_create_requires_returned_folder_id(self) -> None:
         """A malformed folder-create response fails with a controlled error."""

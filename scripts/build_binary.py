@@ -38,6 +38,25 @@ def runtime_distributions():
                 pending.append(requirement.name)
 
 
+def source_revision() -> dict:
+    """Identify this checkout, without attributing an archive to a parent repo."""
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", *args], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+
+    try:
+        if Path(git("rev-parse", "--show-toplevel")).resolve() != ROOT:
+            return {"commit": None, "dirty": None}
+        return {
+            "commit": git("rev-parse", "HEAD"),
+            "dirty": bool(git("status", "--porcelain", "--untracked-files=normal")),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "dirty": None}
+
+
 def write_notices(bundle: Path) -> None:
     notices = bundle / "licenses"
     notices.mkdir(exist_ok=True)
@@ -66,18 +85,12 @@ def write_notices(bundle: Path) -> None:
     url = f"https://raw.githubusercontent.com/python/cpython/v{platform.python_version()}/LICENSE"
     with urllib.request.urlopen(url, timeout=30) as response:
         (notices / "python.txt").write_bytes(response.read())
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        commit = None  # Source archives have no .git directory.
     info = {
         "version": metadata.version("gdrivecopy"),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "architecture": platform.machine(),
-        "commit": commit,
+        **source_revision(),
         "dependencies": dict(sorted(versions.items())),
     }
     (bundle / "BUILD_INFO.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
@@ -132,7 +145,12 @@ def main() -> None:
     write_notices(bundle)
     executable = bundle / ("gdrivecopy.exe" if os.name == "nt" else "gdrivecopy")
     with tempfile.TemporaryDirectory(prefix="gdrivecopy-smoke-") as temporary:
-        for args in (["--version"], ["copy", "--help"], ["doctor", "--json"]):
+        version = subprocess.check_output(
+            [str(executable), "--version"], cwd=temporary, text=True, timeout=90
+        ).strip()
+        if version != f"gdrivecopy {metadata.version('gdrivecopy')}":
+            raise RuntimeError("Bundled source version differs from installed package metadata")
+        for args in (["copy", "--help"], ["doctor", "--json"]):
             subprocess.run([str(executable), *args], check=True, cwd=temporary, timeout=90)
     system = {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}[platform.system()]
     machine = {"amd64": "x86_64", "aarch64": "arm64"}.get(

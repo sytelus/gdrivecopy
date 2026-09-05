@@ -84,7 +84,12 @@ def authenticate(
                 "(Google Auth Platform → Clients → Desktop app → Download JSON)."
             )
         logger.info("Starting OAuth consent flow (opening browser)")
-        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Invalid OAuth client JSON; download a Desktop app client from Google Cloud Console"
+            ) from exc
         options = {"prompt": "select_account consent"} if select_account else {}
         creds = flow.run_local_server(port=0, **options)
 

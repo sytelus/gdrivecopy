@@ -63,20 +63,6 @@ def source_tree_with_symlink(source_tree: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Mock Google credentials
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def mock_credentials() -> MagicMock:
-    """Return a mock ``google.auth.credentials.Credentials`` object."""
-    creds = MagicMock()
-    creds.valid = True
-    creds.token = "fake-access-token"
-    return creds
-
-
-# ---------------------------------------------------------------------------
 # Mock DriveClient
 # ---------------------------------------------------------------------------
 

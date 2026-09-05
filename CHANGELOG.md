@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Validate upload identities before checksum cleanup; refuse recovered folders
+  that moved, changed type/name, or went to trash.
+- Preserve previously completed uploads edited before resume as conflicts;
+  they must not enter failed-upload cleanup.
+- Rebuild interrupted manifests without obsolete files or collision decisions.
+- Preserve fast size-only skips on resume, and refresh receipts after a successful rehash.
+- Reconcile changes during replacement inventory scans, detect change-cursor cycles,
+  and pause cleanly on inventory quota failures.
+- Reject superscript Windows device names and case variants of internal partial directories.
+- Show source scan failures in reports; list healthy jobs even when another database is damaged.
+- Validate account registries and OAuth client errors; close database handles on failed setup.
+- Share stronger secret redaction across startup errors, logs, tracebacks and legacy reports.
+- Record accurate native-build provenance and reject source/package version mismatches.
+
+### Maintenance
+
+- Add regression coverage for these recovery, privacy and reporting cases.
+- Simplify duplicated logging setup, remove an unused retry constant/test fixture,
+  use indexed collision lookups, and refresh installation/recovery guidance.
+
 ## 0.2.0
 
 ### Added

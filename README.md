@@ -25,6 +25,8 @@ Other platforms can install from source with **Python 3.10+**:
 ```sh
 git clone https://github.com/sytelus/gdrivecopy.git
 cd gdrivecopy
+python -m venv .venv
+# Activate: .venv\Scripts\Activate.ps1 (Windows) or source .venv/bin/activate (Linux/macOS)
 python -m pip install .
 gdrivecopy --help
 ```

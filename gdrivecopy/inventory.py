@@ -47,6 +47,10 @@ class DriveInventory:
                 raise
             self.control.emit("phase", phase="Change cursor expired; rebuilding Drive inventory")
             self._initialize(root)
+            self._scan_pending()
+            # The replacement scan can itself take days. Reconcile everything
+            # since its new start token before using it, just like the first scan.
+            self._changes()
         self._scan_pending()
         return actual_id
 
@@ -58,6 +62,7 @@ class DriveInventory:
             db.execute("DELETE FROM remote")
             db.execute("DELETE FROM folders")
             db.execute("DELETE FROM folder_seen")
+            db.execute("DELETE FROM page_tokens")
             db.execute(
                 "INSERT INTO remote VALUES(?,?,?,?,?)", ("", root["id"], None, 1, json.dumps(root))
             )
@@ -187,6 +192,13 @@ class DriveInventory:
             if page.get("nextPageToken") and next_token == token:
                 raise DriveApiError(502, "Drive repeated a change cursor")
             with self.store.transaction() as db:
+                if page.get("nextPageToken"):
+                    if db.execute(
+                        "SELECT 1 FROM page_tokens WHERE parent='@changes' AND token=?",
+                        (next_token,),
+                    ).fetchone():
+                        raise DriveApiError(502, "Drive repeated an earlier change cursor")
+                    db.execute("INSERT OR IGNORE INTO page_tokens VALUES('@changes',?)", (token,))
                 for change in page.get("changes", []):
                     known = db.execute(
                         "SELECT parent FROM remote WHERE id=?", (change.get("fileId"),)
@@ -205,10 +217,10 @@ class DriveInventory:
                     "INSERT OR REPLACE INTO meta VALUES('change_cursor',?)",
                     (json.dumps(next_token),),
                 )
+                if not page.get("nextPageToken"):
+                    db.execute("DELETE FROM page_tokens WHERE parent='@changes'")
             if not page.get("nextPageToken"):
                 return
-            if next_token == token:
-                raise DriveApiError(502, "Drive repeated a change cursor")
             token = next_token
 
     def at(self, path: str) -> dict | None:

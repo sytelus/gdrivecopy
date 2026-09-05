@@ -76,9 +76,15 @@ class JobStore:
             check_same_thread=False,
             timeout=30,
         )
+        try:
+            self._initialize(readonly)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def _initialize(self, readonly: bool) -> None:
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         if version not in {0, 1}:
-            self.db.close()
             raise ValueError(
                 f"Unsupported job schema {version}; use a compatible gdrivecopy version"
             )
@@ -86,7 +92,7 @@ class JobStore:
         if readonly:
             return
         if os.name != "nt":
-            (directory / "job.sqlite3").chmod(0o600)
+            (self.directory / "job.sqlite3").chmod(0o600)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""

@@ -14,6 +14,7 @@ venv/
 
 # OAuth credentials and tokens
 credentials.json
+client_secret*.json
 credentials.json.tmp
 .credentials.json.*.tmp
 token.json
@@ -31,6 +32,7 @@ report.json
 report.json.tmp
 .report.json.*.tmp
 accounts.json
+.accounts.json.*.tmp
 accounts.lock
 job.sqlite3*
 run.lock

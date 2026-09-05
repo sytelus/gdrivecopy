@@ -1,4 +1,4 @@
-include *.md LICENSE .editorconfig
+include *.md LICENSE .editorconfig requirements.txt
 recursive-include scripts *.py
 recursive-include tests *.py
 recursive-include .github *.yml *.md

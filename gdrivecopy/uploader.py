@@ -1,11 +1,8 @@
-"""Upload orchestration.
+"""Shared upload protocol engine and compatibility upload orchestration.
 
-Implements the three-phase workflow described in the PRD:
-
-1. **Scan Drive** -- build an in-memory map of what's already uploaded.
-2. **Scan Local & Upload** -- walk the source directory, skip files already
-   on Drive, upload the rest with concurrent workers.
-3. **Report** -- print a summary.
+Modern jobs call ``upload_file`` with durable identity/session/folder adapters;
+``TransferRunner`` owns their manifests, dispatch and reports. ``run`` retains
+the original in-memory scan/upload/report workflow for ``legacy-upload``.
 
 Thread safety
 -------------
@@ -56,8 +53,6 @@ from gdrivecopy.scanner import _is_link_like, _iso_from_timestamp, scan_local
 from gdrivecopy.session import SessionCache
 
 logger = logging.getLogger(__name__)
-
-MAX_RETRIES = 8
 
 
 class ChecksumError(Exception):
@@ -184,6 +179,8 @@ class Uploader:
             raise ValueError("transfers must be at least 1")
         if config.chunk_size < 256 * 1024 or config.chunk_size % (256 * 1024):
             raise ValueError("chunk_size must be a multiple of 256 KiB")
+        if config.retries < 1:
+            raise ValueError("retries must be at least 1")
         if config.bwlimit is not None and config.bwlimit < 1:
             raise ValueError("bwlimit must be greater than zero")
 
@@ -514,6 +511,7 @@ class Uploader:
 
     def _verify_md5(self, lf: LocalFile, local_md5: str, response: UploadResponse) -> None:
         """Compare local MD5 with Drive's.  Trash and raise on mismatch."""
+        self._assert_upload_identity(lf, response)
         if not self._config.verify_checksum:
             return
         if not response.md5_checksum:
@@ -533,6 +531,7 @@ class Uploader:
 
     def _trash_unverified(self, lf: LocalFile, response: UploadResponse, reason: str) -> None:
         """Trash an unsafe upload or raise without risking a duplicate retry."""
+        self._assert_upload_identity(lf, response)
         try:
             self._drive.trash_file(response.file_id)
         except Exception as exc:
@@ -541,6 +540,14 @@ class Uploader:
             ) from exc
         if self._discard_id is not None:
             self._discard_id(lf)
+
+    def _assert_upload_identity(self, lf: LocalFile, response: UploadResponse) -> None:
+        # Check before both accepting and cleaning up a response. Checking only
+        # in the job runner is too late: checksum failure may already trash it.
+        if self._reserve_id is not None and response.file_id != self._reserve_id(lf):
+            raise CleanupError(
+                "Drive returned a different upload identity than reserved; no item was trashed"
+            )
 
     @staticmethod
     def _new_md5() -> Any:

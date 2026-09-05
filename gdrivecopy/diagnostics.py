@@ -18,7 +18,7 @@ from rich.text import Text
 from gdrivecopy import __version__
 from gdrivecopy.jobstore import JobLock, JobStore
 from gdrivecopy.persistence import write_text_atomic
-from gdrivecopy.transfer import safe_error
+from gdrivecopy.redaction import safe_error
 
 
 def diagnose() -> dict:

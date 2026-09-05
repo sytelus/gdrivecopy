@@ -6,7 +6,6 @@ import fnmatch
 import hashlib
 import json
 import logging
-import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -21,6 +20,7 @@ from gdrivecopy.inventory import DriveInventory, FolderMap
 from gdrivecopy.jobstore import DatabaseSessions, JobStore, utc_now
 from gdrivecopy.models import LocalFile, UploadConfig
 from gdrivecopy.persistence import atomic_text_writer, write_text_atomic
+from gdrivecopy.redaction import safe_error
 from gdrivecopy.scanner import scan_local
 from gdrivecopy.uploader import Uploader, _BandwidthLimiter
 
@@ -49,17 +49,6 @@ EXPORT_TYPES = {
     ),
     "application/vnd.google-apps.drawing": ("image/svg+xml", ".svg"),
 }
-
-
-def safe_error(exc: object) -> str:
-    message = str(exc)
-    message = re.sub(
-        r"(?i)((?:upload_id|access_token|refresh_token|client_secret)=)[^&\s\"']+",
-        r"\1[redacted]",
-        message,
-    )
-    message = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", message)
-    return message
 
 
 def selected(path: str, config: dict) -> bool:
@@ -163,6 +152,10 @@ class TransferRunner:
             )
             self._dispatch(root_id)
             status = "planned" if self.config["dry_run"] else "complete"
+        except QuotaLimitError as exc:
+            status = "paused"
+            self.store.set("stop_reason", "Drive quota reached: " + safe_error(exc))
+            self.store.event(status, message=safe_error(exc))
         except Cancelled as exc:
             status = "cancelled" if self.control.reason == "Cancelled by user" else "paused"
             self.store.set("stop_reason", self.control.reason)
@@ -202,6 +195,13 @@ class TransferRunner:
             self.control.emit("phase", phase="Reusing saved manifest")
             return
         self.control.emit("phase", phase="Building file manifest")
+        # No payload is dispatched until plan_complete is durable. An interrupted
+        # build must restart from one current scan, without retaining removed or
+        # changed files (or namespace decisions) from its earlier partial scan.
+        with self.store.transaction() as db:
+            db.execute("DELETE FROM files")
+            for table in ("targets", "target_nodes", "target_conflicts"):
+                db.execute(f"DROP TABLE IF EXISTS {table}")
         buffer = []
 
         def add(path, data, size):
@@ -228,10 +228,11 @@ class TransferRunner:
                 check_cancel=self.control.check,
             )
             self.store.set("scan_errors", len(scan.errors))
+            self.store.set("scan_errors_sample", [safe_error(error) for error in scan.errors[:20]])
             self.store.set("symlinks_skipped", scan.symlinks_skipped)
             self.store.set("tool_entries_excluded", scan.files_excluded)
             for error in scan.errors:
-                self.store.event("scan_error", message=error)
+                self.store.event("scan_error", message=safe_error(error))
         else:
             for remote in self.store.rows(
                 "SELECT path,data FROM remote WHERE folder=0 ORDER BY path"
@@ -270,7 +271,7 @@ class TransferRunner:
                     try:
                         safe_target(Path(self.config["local_path"]), data["target"])
                         parts = data["target"].split("/")
-                        if parts[0].startswith(".gdrivecopy-"):
+                        if parts[0].casefold().startswith(".gdrivecopy-"):
                             raise ValueError(
                                 "Name conflicts with reserved partial-download directories"
                             )
@@ -323,8 +324,8 @@ class TransferRunner:
             with self.store.transaction() as db:
                 db.execute(
                     "UPDATE files SET status='conflict',error='Unsafe namespace: destination collision' "
-                    "WHERE path IN (SELECT path FROM targets WHERE name=? OR substr(name,1,?)=?)",
-                    (collision["name"], len(prefix), prefix),
+                    "WHERE path IN (SELECT path FROM targets WHERE name=? OR (name>=? AND name<?))",
+                    (collision["name"], prefix, collision["name"] + "0"),
                 )
 
     def _reconcile_completed(self) -> None:
@@ -416,8 +417,14 @@ class TransferRunner:
                             self.store.update_file(
                                 row["path"],
                                 status=result["status"],
-                                proof=json.dumps(result.get("proof")),
                                 error=result.get("error"),
+                                # Conflicts must retain prior receipts, including
+                                # across repeated resumes of an edited upload.
+                                **(
+                                    {"proof": json.dumps(result["proof"])}
+                                    if "proof" in result
+                                    else {}
+                                ),
                             )
                             event = (
                                 "done"
@@ -499,6 +506,17 @@ class TransferRunner:
                             "status": "conflict",
                             "error": "Previously created Drive item moved or was renamed; review it before starting a new job",
                         }
+                    proof = json.loads(row["proof"] or "null")
+                    if proof and (
+                        str(reserved.get("size")) != str(proof["size"])
+                        or (proof.get("md5") and reserved.get("md5Checksum") != proof["md5"])
+                    ):
+                        # This item was already accepted in a previous run.
+                        # A later edit must not enter failed-upload cleanup.
+                        return {
+                            "status": "conflict",
+                            "error": "Previously copied Drive content changed; review it before starting a new job",
+                        }
             if remote and remote["id"] != row["remote_id"]:
                 if remote["folder"]:
                     return {"status": "conflict", "error": "Drive folder occupies file path"}
@@ -568,7 +586,10 @@ class TransferRunner:
                 and target.stat().st_mtime_ns == proof.get("mtime_ns")
             ):
                 return {"status": "copied_unverified", "proof": proof}
-            if self.config["existing"] == "checksum" or row["proof"]:
+            # Older jobs store absent receipts as the JSON string 'null', which
+            # is truthy in Python. Only an actual receipt justifies rehashing a
+            # size-only skip on resume.
+            if self.config["existing"] == "checksum" or proof:
                 hasher = (
                     hashlib.sha256()
                     if source.get("export_mime")
@@ -597,6 +618,7 @@ class TransferRunner:
                         "error": "Existing local checksum differs or is unavailable",
                     }
                 if (proof and proof.get("verified")) or source.get("export_mime"):
+                    proof["mtime_ns"] = after.st_mtime_ns
                     return {
                         "status": "exported" if source.get("export_mime") else "copied",
                         "proof": proof,
@@ -683,6 +705,7 @@ def build_report(store: JobStore) -> dict:
         "last_started": store.get("last_started"),
         "last_finished": store.get("last_finished"),
         "scan_errors": store.get("scan_errors", 0),
+        "scan_errors_sample": store.get("scan_errors_sample", []),
         "symlinks_skipped": store.get("symlinks_skipped", 0),
         "tool_entries_excluded": store.get("tool_entries_excluded", 0),
         "fatal_error": store.get("fatal_error"),

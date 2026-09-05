@@ -13,6 +13,8 @@
 | `downloader.py` | Safe paths, durable ranges, checksum, export, no-clobber publication |
 | `drive.py` | Validated metadata operations and raw HTTP protocol |
 | `control.py`, `terminal.py` | Cancellation, bounded progress model, Rich dashboard/report |
+| `redaction.py` | Shared secret filtering for modern/legacy errors, logs and reports |
+| `diagnostics.py` | Offline discovery, TLS and local persistence checks |
 | `scanner.py` | Deterministic traversal, metadata, exclusions and errors |
 | `persistence.py` | Unique private temporary files, sync and atomic replacement |
 | `session.py`, `report.py`, `models.py` | Shared records and compatibility JSON state/reporting |
@@ -66,7 +68,9 @@ downloadable Actions artifacts. To release:
 
 No PyPI upload, signing certificate or notarization is configured. Native builds
 are not byte-for-byte reproducible; `BUILD_INFO.json` records dependency versions
-and source commit for investigation. Offline tests do not replace live migration
+and source commit plus a `dirty` flag for local modifications. Source archives
+report an unknown commit rather than inheriting a parent repository's history.
+Offline tests do not replace live migration
 validation. Publishing requires repository Actions with contents-write permission
 only in the final publish job.
 
@@ -84,7 +88,9 @@ detect file/directory aliases. Reports can open state read-only while a job runs
 Critical orderings:
 
 1. Persist a generated create ID **before** sending payload; retry that ID after
-   a lost response. Persist folder IDs across restarts too.
+   a lost response. Validate the returned identity before accepting or trashing
+   an upload. Persist folder IDs across restarts, and verify a recovered folder's
+   current parent, name, type and trash state before using it.
 2. Write/fsync a download range **before** saving its offset. Truncate excess
    bytes on resume, restart missing/short parts, rehash a verified prefix locally.
 3. Save the verification receipt **before** final publication. Windows rename
@@ -93,7 +99,10 @@ Critical orderings:
 4. Recheck upload source identity before accepting completion. Trash a newly
    created unverified item before trying another ID; failed cleanup stops.
 5. Capture a change cursor **before** the initial scan; commit cursor advance
-   together with affected-folder invalidation.
+   together with affected-folder invalidation. Apply the same ordering after an
+   expired cursor forces a rebuild. Detect repeated listing/change page tokens.
+6. Complete namespace validation and persist `plan_complete` before dispatch.
+   Discard only unfinished planning rows on restart; never reset a finished plan.
 
 Modern checkpoint/identity persistence errors stop the operation. Legacy JSON
 sessions retain best-effort persistence; do not extend that fallback to SQLite.
@@ -121,6 +130,8 @@ auth, scanning and reports. `test_jobs.py` covers durable jobs/crash boundaries;
 `test_download_protocol.py` validates responses independently of the fake server;
 `test_commands.py` covers profiles, CLI wiring and dashboard rendering. Assert
 observable safety properties rather than reproducing implementation details.
+`test_redaction.py` checks diagnostic privacy, including startup errors and
+tracebacks; `test_build.py` checks build provenance.
 
 Update README, operations guidance, PRD, CLI help and report consumers together.
 Fail closed on newer state schemas. Do not commit credentials, capabilities,

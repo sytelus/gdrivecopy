@@ -23,10 +23,12 @@ human summary, JSON statistics, per-file CSV, rotating logs and audit export.
 - Never overwrite/delete pre-existing destinations. Cleanup may trash only a
   newly created unverified upload; failed cleanup stops that file.
 - Persist generated file/folder IDs before creates. Ambiguous responses retry
-  the same ID to prevent duplicate creation.
+  the same ID to prevent duplicate creation. Check returned file identities
+  before cleanup and revalidate recovered folders before using them.
 - Bind jobs to actual Google user/root, absolute local path, and a fixed source
   manifest. Changed source identity/size/mtime/version cannot silently join a
   different transfer.
+  Planning is fixed only when complete; rebuild unfinished planning after interruption.
 - Report unreadable files, unsafe/duplicate paths, file/folder collisions,
   permissions failures and unsupported items. Incomplete listing is not success.
 - Google-native exports are conversions with distinct outcomes. Their local
@@ -45,8 +47,9 @@ human summary, JSON statistics, per-file CSV, rotating logs and audit export.
 - Retry transient errors with bounded cancellable backoff. Stop scheduling on
   cancellation, blocking quota or repeated failures. Resume is explicit.
 - OS-owned locks prevent concurrent writers to one job and release on crashes.
-- Required identity/checkpoint writes are mandatory. Reports/logs/audit must not
-  expose OAuth tokens, headers, or resumable capabilities.
+- Required identity/checkpoint writes are mandatory. Avoid recording OAuth
+  tokens, headers or resumable capabilities; redact common diagnostic forms.
+  Redaction is best-effort, so users must review diagnostic exports before sharing.
 
 ## Limits and acceptance evidence
 

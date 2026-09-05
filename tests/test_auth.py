@@ -108,3 +108,10 @@ class TestAuthenticate:
         token.write_text(payload)
         with pytest.raises(FileNotFoundError, match="OAuth credentials not found"):
             authenticate(tmp_path / "missing.json", token)
+
+    @pytest.mark.parametrize("payload", ['{"installed": {}}', "[]", "{broken"])
+    def test_malformed_client_json_has_actionable_error(self, tmp_path, payload):
+        client = tmp_path / "client.json"
+        client.write_text(payload)
+        with pytest.raises(ValueError, match="Desktop app client"):
+            authenticate(client, tmp_path / "token.json")

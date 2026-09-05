@@ -95,7 +95,59 @@ def test_expired_change_cursor_rebuilds_inventory(inventory):
     drive.add_file("file", b"data")
     inv.sync("root")
     calls = drive.page_calls
-    with patch.object(drive, "change_page", side_effect=DriveApiError(410, "expired")):
+    with patch.object(
+        drive,
+        "change_page",
+        side_effect=[DriveApiError(410, "expired"), drive.change_page(drive.change_token())],
+    ):
         inv.sync("root")
     assert drive.page_calls == calls + 1
     assert inv.at("file")
+
+
+def test_replacement_inventory_reconciles_changes_during_its_scan(inventory):
+    inv, drive = inventory
+    identity = drive.add_file("old", b"data")
+    inv.sync("root")
+    original_page, original_changes = drive.folder_page, drive.change_page
+    expired = True
+    changed = False
+
+    def changes(token):
+        nonlocal expired
+        if expired:
+            expired = False
+            raise DriveApiError(410, "expired")
+        return original_changes(token)
+
+    def page(*args):
+        nonlocal changed
+        result = original_page(*args)
+        if not changed:
+            changed = True
+            drive.items[identity]["name"] = "new"
+            drive.changes.append({"fileId": identity, "file": dict(drive.items[identity])})
+        return result
+
+    with patch.object(drive, "change_page", changes), patch.object(drive, "folder_page", page):
+        inv.sync("root")
+    assert inv.at("old") is None
+    assert inv.at("new")["id"] == identity
+
+
+def test_nonadjacent_change_cursor_cycle_fails_without_looping(inventory):
+    inv, drive = inventory
+    with (
+        patch.object(
+            drive,
+            "change_page",
+            side_effect=[
+                {"changes": [], "nextPageToken": "a"},
+                {"changes": [], "nextPageToken": "b"},
+                {"changes": [], "nextPageToken": "a"},
+            ],
+        ) as pages,
+        pytest.raises(DriveApiError, match="earlier change cursor"),
+    ):
+        inv.sync("root")
+    assert pages.call_count == 3

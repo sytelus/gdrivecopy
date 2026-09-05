@@ -650,7 +650,7 @@ class TestRetryOnTransientError:
         mock_drive: MagicMock,
         make_local_file: Any,
     ) -> None:
-        """After MAX_RETRIES transient failures, the file is marked failed."""
+        """Exhausting the configured retry budget marks the file failed."""
         content = b"exhausted"
         lf = make_local_file(name="exhaust.txt", content=content)
 

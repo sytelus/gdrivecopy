@@ -18,8 +18,60 @@ from tests.fake_drive import FakeDrive
 
 
 def registry(tmp_path, profiles, default=None):
+    profiles = {
+        name: {"id": name, "email": f"{name}@example.test", "credentials": "client.json", **profile}
+        for name, profile in profiles.items()
+    }
     (tmp_path / "accounts.json").write_text(json.dumps({"profiles": profiles, "default": default}))
     return Accounts(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"profiles": {"../escape": {}}},
+        {"profiles": {"one": None}},
+        {"profiles": {"one": {"id": 12, "email": "a", "credentials": "b"}}},
+        {"profiles": {}, "default": []},
+        {"profiles": {}, "default": "missing"},
+    ],
+)
+def test_invalid_account_registry_fails_before_authentication(tmp_path, payload):
+    (tmp_path / "accounts.json").write_text(json.dumps(payload))
+    with (
+        patch("gdrivecopy.accounts.authenticate") as auth,
+        pytest.raises(ValueError, match="Invalid"),
+    ):
+        Accounts(tmp_path).connect()
+    auth.assert_not_called()
+
+
+def test_jobs_shows_healthy_jobs_and_closes_connections_when_one_is_corrupt(tmp_path, capsys):
+    good = JobStore(tmp_path / "jobs" / "20260904-120000-1234abcd")
+    good.set("config", {"direction": "download", "account_email": "user@example.test"})
+    good.set("status", "complete")
+    good.close()
+    bad = tmp_path / "jobs" / "20260904-130000-1234abcd"
+    bad.mkdir()
+    (bad / "job.sqlite3").write_bytes(b"not a database")
+    connections = []
+    connect = sqlite3.connect
+
+    def tracked(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        connections.append(db)
+        return db
+
+    args = _build_parser().parse_args(["jobs", "--state-dir", str(tmp_path)])
+    with patch("gdrivecopy.commands.sqlite3.connect", tracked):
+        assert execute(args) == 1
+    output = capsys.readouterr()
+    assert "Unreadable" in output.out and "complete" in output.out
+    assert "not a database" in output.err
+    assert len(connections) == 2
+    for db in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            db.execute("SELECT 1")
 
 
 def test_multiple_accounts_need_explicit_choice(tmp_path):

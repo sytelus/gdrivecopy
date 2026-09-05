@@ -657,7 +657,21 @@ class DriveClient:
             )
         except HttpError as exc:
             if exc.resp.status == 409:
-                return folder_id  # This client reserved the ID before creation.
+                # A durable ID proves ownership of the creation attempt, not
+                # the folder's current location after a long interruption.
+                current = self.file_metadata(folder_id)
+                if (
+                    current.get("id") != folder_id
+                    or current.get("name") != name
+                    or current.get("mimeType") != FOLDER_MIME
+                    or current.get("trashed")
+                    or parent_id not in current.get("parents", [])
+                ):
+                    raise DrivePathConflictError(
+                        409,
+                        "Previously created folder moved, changed, or was trashed; review it before resuming",
+                    ) from exc
+                return folder_id
             raise _make_api_error(exc.resp.status, str(exc), _error_reasons(exc.content)) from exc
         except (RequestException, HttpLib2Error, ConnectionError, OSError) as exc:
             raise DriveApiError(503, f"Connection error while creating folder {name!r}") from exc

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from gdrivecopy.models import UploadStats
 from gdrivecopy.persistence import write_text_atomic
+from gdrivecopy.redaction import safe_error
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ def format_report(stats: UploadStats) -> str:
             lines.append(f"    ... and {len(stats.errors) - 20} more (see log)")
 
     lines.append("")
-    return "\n".join(lines)
+    return safe_error("\n".join(lines))
 
 
 def save_report_json(stats: UploadStats, path: Path) -> None:
@@ -98,7 +99,7 @@ def save_report_json(stats: UploadStats, path: Path) -> None:
         "files_failed": stats.files_failed,
         "duration_seconds": round(stats.duration_seconds, 2),
         "quota_limit_hits": stats.quota_limit_hits,
-        "errors": stats.errors,
+        "errors": [safe_error(error) for error in stats.errors],
         "mismatch_details": stats.mismatch_details,
     }
     write_text_atomic(path, json.dumps(data, indent=2))
