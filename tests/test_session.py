@@ -11,7 +11,6 @@ import pytest
 from gdrivecopy.models import SessionEntry
 from gdrivecopy.session import SessionCache
 
-
 # ---------------------------------------------------------------------------
 # Load / save
 # ---------------------------------------------------------------------------
@@ -32,7 +31,10 @@ class TestSessionCacheLoad:
 
         entry = cache.get("photos/img001.jpg")
         assert entry is not None
-        assert entry.session_uri == "https://upload.example.com/session1"
+        assert (
+            entry.session_uri
+            == "https://www.googleapis.com/upload/drive/v3/files?upload_id=session1"
+        )
         assert entry.file_size == 1024
         assert entry.mtime == "2025-01-01T00:00:00+00:00"
 
@@ -60,6 +62,33 @@ class TestSessionCacheLoad:
         cache.load()
         assert len(cache) == 0
 
+    @pytest.mark.parametrize("payload", ["[]", "null", '"not an object"'])
+    def test_load_non_object_json(self, session_file: Path, payload: str) -> None:
+        """Syntactically valid but structurally invalid JSON is disposable."""
+        session_file.write_text(payload, encoding="utf-8")
+        cache = SessionCache(session_file)
+
+        cache.load()
+
+        assert len(cache) == 0
+
+    def test_load_missing_file_clears_existing_memory(self, session_file: Path) -> None:
+        """Reloading after cache deletion cannot retain stale in-memory sessions."""
+        cache = SessionCache(session_file)
+        cache.put(
+            "x.txt",
+            SessionEntry(
+                "https://www.googleapis.com/upload/drive/v3/files?upload_id=x",
+                1,
+                "2025-01-01T00:00:00Z",
+            ),
+        )
+        session_file.unlink()
+
+        cache.load()
+
+        assert len(cache) == 0
+
 
 class TestSessionCacheSave:
     def test_save_creates_file(self, session_file: Path) -> None:
@@ -70,7 +99,11 @@ class TestSessionCacheSave:
 
     def test_save_round_trips(self, session_file: Path) -> None:
         """Data saved can be loaded back correctly."""
-        entry = SessionEntry("uri_x", 999, "2025-06-15T12:00:00+00:00")
+        entry = SessionEntry(
+            "https://www.googleapis.com/upload/drive/v3/files?upload_id=uri_x",
+            999,
+            "2025-06-15T12:00:00+00:00",
+        )
         cache1 = SessionCache(session_file)
         cache1.put("doc/report.pdf", entry)
 
@@ -78,15 +111,32 @@ class TestSessionCacheSave:
         cache2.load()
         loaded = cache2.get("doc/report.pdf")
         assert loaded is not None
-        assert loaded.session_uri == "uri_x"
+        assert (
+            loaded.session_uri == "https://www.googleapis.com/upload/drive/v3/files?upload_id=uri_x"
+        )
         assert loaded.file_size == 999
         assert loaded.mtime == "2025-06-15T12:00:00+00:00"
 
     def test_save_is_atomic(self, session_file: Path) -> None:
         """save() writes to a .tmp file then renames, so .tmp should not linger."""
         cache = SessionCache(session_file)
-        cache.put("f.txt", SessionEntry("u", 1, "t"))
-        assert not session_file.with_suffix(".tmp").exists()
+        cache.put(
+            "f.txt",
+            SessionEntry("https://www.googleapis.com/upload/drive/v3/files?upload_id=u", 1, "t"),
+        )
+        assert not session_file.with_name(f"{session_file.name}.tmp").exists()
+
+    def test_save_creates_parent_directory(self, tmp_path: Path) -> None:
+        """A configured cache path may live in a directory that does not exist yet."""
+        session_file = tmp_path / "state" / "sessions.json"
+        cache = SessionCache(session_file)
+
+        cache.put(
+            "f.txt",
+            SessionEntry("https://www.googleapis.com/upload/drive/v3/files?upload_id=u", 1, "t"),
+        )
+
+        assert session_file.exists()
 
 
 # ---------------------------------------------------------------------------

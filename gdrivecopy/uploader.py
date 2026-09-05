@@ -23,22 +23,26 @@ import hashlib
 import itertools
 import logging
 import random
+import stat
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import requests.exceptions
-
-from google.auth.transport.requests import Request
 from googleapiclient.errors import HttpError
 
 from gdrivecopy.drive import (
+    MULTIPART_THRESHOLD,
     DriveApiError,
     DriveClient,
-    DailyLimitError,
+    QuotaLimitError,
     RateLimitError,
     UploadResponse,
+    UploadSessionError,
+    UploadStatus,
 )
 from gdrivecopy.models import (
     DriveFile,
@@ -47,12 +51,11 @@ from gdrivecopy.models import (
     UploadConfig,
     UploadStats,
 )
-from gdrivecopy.scanner import scan_local, ScanResult
+from gdrivecopy.scanner import _is_link_like, _iso_from_timestamp, scan_local
 from gdrivecopy.session import SessionCache
 
 logger = logging.getLogger(__name__)
 
-MULTIPART_THRESHOLD = 8 * 1024 * 1024  # 8 MiB
 MAX_RETRIES = 8
 
 
@@ -60,11 +63,24 @@ class ChecksumError(Exception):
     """Raised when the post-upload MD5 does not match the local file."""
 
 
+class SourceFileChangedError(OSError):
+    """Raised when a source file changes after the initial scan."""
+
+
+class CleanupError(Exception):
+    """Raised when an unverified Drive item cannot be moved to trash safely."""
+
+
+class AmbiguousMultipartError(Exception):
+    """Raised when a one-request upload may have succeeded despite an error."""
+
+
 # ------------------------------------------------------------------
 # Worker result (returned by _upload_one, consumed by main thread)
 # ------------------------------------------------------------------
 
-@dataclass
+
+@dataclass(frozen=True, slots=True)
 class _WorkerResult:
     """Immutable result returned by a worker thread."""
 
@@ -78,6 +94,7 @@ class _WorkerResult:
 # ------------------------------------------------------------------
 # Circuit breaker
 # ------------------------------------------------------------------
+
 
 class _CircuitBreaker:
     """Pauses uploads after *threshold* consecutive failures."""
@@ -108,9 +125,36 @@ class _CircuitBreaker:
             time.sleep(self._pause)
 
 
+class _BandwidthLimiter:
+    """Coordinate a process-wide average upload-rate limit across workers."""
+
+    def __init__(self, bytes_per_second: int | None) -> None:
+        self._rate = bytes_per_second
+        self._next_slot = 0.0
+        self._lock = threading.Lock()
+
+    def wait_for_slot(self, byte_count: int, stop_event: threading.Event | None = None) -> None:
+        """Wait until *byte_count* bytes fit in the shared transfer schedule."""
+        if self._rate is None or byte_count <= 0:
+            return
+
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + byte_count / self._rate
+
+        delay = slot - now
+        if delay > 0:
+            if stop_event is None:
+                time.sleep(delay)
+            else:
+                stop_event.wait(delay)
+
+
 # ------------------------------------------------------------------
 # Uploader
 # ------------------------------------------------------------------
+
 
 class Uploader:
     """Orchestrates the full upload workflow.
@@ -121,17 +165,28 @@ class Uploader:
     """
 
     def __init__(self, config: UploadConfig, drive: DriveClient) -> None:
+        if not config.drive_folder_id.strip():
+            raise ValueError("drive_folder_id must not be empty")
+        if config.transfers < 1:
+            raise ValueError("transfers must be at least 1")
+        if config.chunk_size < 256 * 1024 or config.chunk_size % (256 * 1024):
+            raise ValueError("chunk_size must be a multiple of 256 KiB")
+        if config.bwlimit is not None and config.bwlimit < 1:
+            raise ValueError("bwlimit must be greater than zero")
+
         self._config = config
         self._drive = drive
         self._session_cache = SessionCache(config.session_path)
         self._stats = UploadStats()
         self._breaker = _CircuitBreaker()
-        self._daily_limit_hit = threading.Event()
+        self._bandwidth_limiter = _BandwidthLimiter(config.bwlimit)
+        self._quota_limit_hit = threading.Event()
 
         # Populated during Phase 1, guarded by _folder_lock for writes.
         self._file_map: dict[str, DriveFile] = {}
         self._folder_map: dict[str, str] = {}
         self._folder_lock = threading.Lock()
+        self._root_folder_id = config.drive_folder_id
 
     # ------------------------------------------------------------------
     # Public API
@@ -140,18 +195,33 @@ class Uploader:
     def run(self) -> UploadStats:
         """Execute the full scan -> upload -> report workflow."""
         start = time.monotonic()
+        self._stats = UploadStats()
+        self._breaker = _CircuitBreaker()
+        self._bandwidth_limiter = _BandwidthLimiter(self._config.bwlimit)
+        self._quota_limit_hit.clear()
 
         # Phase 1: Scan Drive.
         logger.info("Phase 1: Scanning Drive folder %s", self._config.drive_folder_id)
-        self._file_map, self._folder_map = self._drive.list_all(
-            self._config.drive_folder_id
-        )
+        self._file_map, self._folder_map = self._drive.list_all(self._config.drive_folder_id)
+        self._root_folder_id = self._folder_map[""]
         self._session_cache.load()
 
         # Phase 2: Scan local & decide.
         logger.info("Phase 2: Scanning local directory %s", self._config.source_dir)
-        scan = scan_local(self._config.source_dir)
+        owned_paths = {
+            self._config.credentials_path.resolve(),
+            self._config.token_path.resolve(),
+            self._config.session_path.resolve(),
+            (self._config.log_dir / "report.json").resolve(),
+        }
+        if self._config.log_path is not None:
+            owned_paths.add(self._config.log_path.resolve())
+        excluded_paths = owned_paths | {path.with_name(f"{path.name}.tmp") for path in owned_paths}
+        scan = scan_local(self._config.source_dir, excluded_paths)
         self._stats.symlinks_skipped = scan.symlinks_skipped
+        self._stats.files_excluded = scan.files_excluded
+        self._stats.scan_errors = len(scan.errors)
+        self._stats.errors.extend(scan.errors)
         files_to_upload: list[LocalFile] = []
 
         for lf in scan.files:
@@ -162,8 +232,15 @@ class Uploader:
             elif action == "size_mismatch":
                 self._stats.files_skipped += 1
                 self._stats.size_mismatches += 1
+            elif action == "path_conflict":
+                self._stats.files_skipped += 1
+                self._stats.path_conflicts += 1
             else:
                 files_to_upload.append(lf)
+                if self._config.dry_run:
+                    logger.info("Would upload: %s (%d bytes)", lf.relative_path, lf.size)
+
+        self._stats.files_to_upload = len(files_to_upload)
 
         logger.info(
             "Scan complete: %d to upload, %d skipped, %d size mismatches",
@@ -185,18 +262,31 @@ class Uploader:
     # ------------------------------------------------------------------
 
     def _classify(self, lf: LocalFile) -> str:
-        """Return ``"skip"``, ``"size_mismatch"``, or ``"upload"``."""
+        """Classify without introducing file/folder collisions on Drive."""
+        parts = lf.relative_path.split("/")
+        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts)))
+        collision = next((path for path in ancestors if path in self._file_map), None)
+        if f"{lf.relative_path}/" in self._folder_map:
+            collision = lf.relative_path
+        if collision is not None:
+            detail = f"{lf.relative_path}: file/folder conflict at Drive path {collision!r}"
+            logger.error(detail)
+            self._stats.errors.append(detail)
+            return "path_conflict"
         drive_file = self._file_map.get(lf.relative_path)
         if drive_file is None:
             return "upload"
+        if not self._config.dry_run and self._session_cache.get(lf.relative_path) is not None:
+            # Drive is authoritative.  A visible item makes any leftover
+            # resumable URI obsolete, including one left after a lost final
+            # response in an earlier process.
+            self._session_cache.remove(lf.relative_path)
         if drive_file.size == lf.size:
             logger.debug("Skipping (on Drive, same size): %s", lf.relative_path)
             return "skip"
 
-        detail = (
-            f"{lf.relative_path}: local={lf.size} bytes, "
-            f"drive={drive_file.size} bytes"
-        )
+        drive_size = f"{drive_file.size} bytes" if drive_file.size is not None else "unknown"
+        detail = f"{lf.relative_path}: local={lf.size} bytes, drive={drive_size}"
         logger.warning("Size mismatch: %s", detail)
         self._stats.mismatch_details.append(detail)
         return "size_mismatch"
@@ -220,6 +310,7 @@ class Uploader:
 
         with ThreadPoolExecutor(max_workers=self._config.transfers) as pool:
             pending: dict[Future[_WorkerResult], LocalFile] = {}
+            stop_submitting = False
 
             # Seed the pool with up to `transfers` tasks.
             for lf in itertools.islice(file_iter, self._config.transfers):
@@ -227,18 +318,23 @@ class Uploader:
 
             while pending:
                 done, _ = concurrent.futures.wait(
-                    pending, return_when=concurrent.futures.FIRST_COMPLETED,
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 for fut in done:
                     lf = pending.pop(fut)
-                    stop = self._handle_result(fut, lf)
-                    if stop:
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        pending.clear()
-                        break
+                    stop_submitting |= self._handle_result(fut, lf)
+
+                if stop_submitting:
+                    # Running requests cannot be forcefully interrupted, but
+                    # queued work can be canceled.  Keep draining running
+                    # futures so completed work is reflected in the report.
+                    for fut in list(pending):
+                        if fut.cancel():
+                            pending.pop(fut)
 
                 # Submit more work to keep the pool full.
-                if not self._daily_limit_hit.is_set():
+                if not stop_submitting:
                     for lf in itertools.islice(
                         file_iter,
                         self._config.transfers - len(pending),
@@ -249,13 +345,15 @@ class Uploader:
         """Process a completed future.  Returns True to stop all uploads."""
         try:
             result = fut.result()
-        except DailyLimitError:
-            self._stats.daily_limit_hits += 1
-            self._daily_limit_hit.set()
-            logger.error(
-                "Daily limit (750 GB) reached. "
-                "Re-run the tool after ~24 hours to continue."
-            )
+        except QuotaLimitError:
+            first_hit = self._stats.quota_limit_hits == 0
+            self._quota_limit_hit.set()
+            if first_hit:
+                self._stats.quota_limit_hits = 1
+                logger.error(
+                    "A nonretryable Drive storage, item, or daily API quota was reached. "
+                    "Review the Drive account and Google Cloud quota settings before retrying."
+                )
             return True
         except Exception as exc:
             self._breaker.record_failure()
@@ -289,13 +387,19 @@ class Uploader:
         """
         auth_retried = False
         for attempt in range(MAX_RETRIES):
-            if self._daily_limit_hit.is_set():
-                raise DailyLimitError(403, "Daily limit reached")
+            if self._quota_limit_hit.is_set():
+                raise QuotaLimitError(403, "Blocking Drive quota reached")
             try:
                 return self._upload_one_attempt(lf)
-            except DailyLimitError:
+            except QuotaLimitError:
+                self._quota_limit_hit.set()
                 raise
             except RateLimitError as exc:
+                self._backoff(lf, attempt, exc)
+            except UploadSessionError as exc:
+                # The server explicitly rejected this resumable session. Clear
+                # it before retrying so the next attempt creates a new one.
+                self._session_cache.remove(lf.relative_path)
                 self._backoff(lf, attempt, exc)
             except (DriveApiError, HttpError) as exc:
                 status = exc.status if isinstance(exc, DriveApiError) else exc.resp.status
@@ -303,53 +407,74 @@ class Uploader:
                     if auth_retried:
                         logger.error("Auth failure after token refresh: %s", lf.relative_path)
                         return _WorkerResult(success=False, error=str(exc), is_permanent=True)
-                    self._refresh_token()
+                    refresh_error = self._refresh_token()
+                    if refresh_error is not None:
+                        return _WorkerResult(
+                            success=False,
+                            error=refresh_error,
+                            is_permanent=True,
+                        )
                     auth_retried = True
                     continue  # retry immediately, no backoff
-                if 400 <= status < 500 and status not in (429,):
+                if 400 <= status < 500 and status not in (408, 429):
                     logger.error("Permanent failure: %s -- %s", lf.relative_path, exc)
                     return _WorkerResult(success=False, error=str(exc), is_permanent=True)
                 self._backoff(lf, attempt, exc)
             except ChecksumError as exc:
                 # MD5 mismatch -- always retry (file was trashed, re-upload).
                 self._backoff(lf, attempt, exc)
+            except CleanupError as exc:
+                # Retrying could create a duplicate because the unverified
+                # Drive item may still exist.  Stop this file for manual review.
+                logger.error("Cleanup failure: %s -- %s", lf.relative_path, exc)
+                return _WorkerResult(success=False, error=str(exc), is_permanent=True)
+            except AmbiguousMultipartError as exc:
+                # A one-request upload has no status endpoint. The file may
+                # exist even though its response was lost, so retrying now can
+                # create a duplicate. A later run will reconcile Drive first.
+                logger.error("Ambiguous multipart result: %s -- %s", lf.relative_path, exc)
+                return _WorkerResult(success=False, error=str(exc), is_permanent=True)
+            except requests.exceptions.RequestException as exc:
+                # Timeouts, TLS failures, and connection resets are all
+                # transport errors and are safe to retry via the resumable
+                # session status check on the next attempt.
+                self._backoff(lf, attempt, exc)
             except OSError as exc:
-                # requests.ConnectionError is a subclass of OSError (not
-                # builtins.ConnectionError), so network failures land here.
-                # Distinguish network errors (retryable) from local I/O
-                # errors (permanent).
-                if isinstance(exc, requests.exceptions.ConnectionError):
-                    self._backoff(lf, attempt, exc)
-                else:
-                    logger.error(
-                        "Local read error: %s -- %s", lf.relative_path, exc
-                    )
-                    return _WorkerResult(
-                        success=False, error=str(exc), is_permanent=True
-                    )
+                logger.error("Local read error: %s -- %s", lf.relative_path, exc)
+                return _WorkerResult(success=False, error=str(exc), is_permanent=True)
 
         logger.error("Max retries exceeded: %s", lf.relative_path)
         return _WorkerResult(success=False, error="max retries exceeded")
 
-    def _refresh_token(self) -> None:
-        """Attempt to refresh the OAuth token."""
+    def _refresh_token(self) -> str | None:
+        """Refresh the OAuth token and return an error message on failure."""
         try:
-            self._drive._creds.refresh(Request())
+            self._drive.refresh_credentials()
             logger.info("OAuth token refreshed")
+            return None
         except Exception as exc:
-            logger.warning("Token refresh failed: %s", exc)
+            message = f"OAuth token refresh failed: {exc}"
+            logger.error(message)
+            return message
 
     @staticmethod
     def _backoff(lf: LocalFile, attempt: int, exc: Exception) -> None:
-        delay = min(60, 2 ** attempt) * random.random()
+        if attempt + 1 >= MAX_RETRIES:
+            return  # No pointless sleep after the final failed attempt.
+        delay = min(60, 2**attempt) * random.random()
         logger.warning(
             "%s (attempt %d/%d), backing off %.1fs: %s",
-            lf.relative_path, attempt + 1, MAX_RETRIES, delay, exc,
+            lf.relative_path,
+            attempt + 1,
+            MAX_RETRIES,
+            delay,
+            exc,
         )
         time.sleep(delay)
 
     def _upload_one_attempt(self, lf: LocalFile) -> _WorkerResult:
         """Single upload attempt."""
+        self._assert_source_unchanged(lf)
         parent_id = self._ensure_parent_folder(lf.relative_path)
         if lf.size <= MULTIPART_THRESHOLD:
             return self._upload_small(lf, parent_id)
@@ -359,20 +484,68 @@ class Uploader:
     # MD5 verification (shared by small + resumable paths)
     # ------------------------------------------------------------------
 
-    def _verify_md5(
-        self, lf: LocalFile, local_md5: str, response: UploadResponse
-    ) -> None:
+    def _verify_md5(self, lf: LocalFile, local_md5: str, response: UploadResponse) -> None:
         """Compare local MD5 with Drive's.  Trash and raise on mismatch."""
-        if not self._config.verify_checksum or not response.md5_checksum:
+        if not self._config.verify_checksum:
             return
+        if not response.md5_checksum:
+            logger.error("Drive omitted MD5 checksum for %s", lf.relative_path)
+            self._trash_unverified(lf, response, "Drive omitted its MD5 checksum")
+            raise ChecksumError(f"Drive omitted MD5 checksum: {lf.relative_path}")
         if local_md5 == response.md5_checksum:
             return
         logger.error(
             "MD5 mismatch for %s: local=%s drive=%s",
-            lf.relative_path, local_md5, response.md5_checksum,
+            lf.relative_path,
+            local_md5,
+            response.md5_checksum,
         )
-        self._drive.trash_file(response.file_id)
+        self._trash_unverified(lf, response, "MD5 checksum mismatch")
         raise ChecksumError(f"MD5 mismatch: {lf.relative_path}")
+
+    def _trash_unverified(self, lf: LocalFile, response: UploadResponse, reason: str) -> None:
+        """Trash an unsafe upload or raise without risking a duplicate retry."""
+        try:
+            self._drive.trash_file(response.file_id)
+        except Exception as exc:
+            raise CleanupError(
+                f"{reason}; could not trash Drive item {response.file_id}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _new_md5() -> Any:
+        """Create an MD5 hasher for Drive integrity checks, not security."""
+        return hashlib.md5(usedforsecurity=False)
+
+    @classmethod
+    def _file_md5(cls, path: Path) -> str:
+        """Hash a local file without loading a second full copy into memory."""
+        hasher = cls._new_md5()
+        with path.open("rb") as file_obj:
+            for block in iter(lambda: file_obj.read(1024 * 1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest()
+
+    @staticmethod
+    def _assert_source_unchanged(lf: LocalFile) -> None:
+        """Fail safely if a source file changed since it was scanned."""
+        try:
+            if _is_link_like(lf.path):
+                raise SourceFileChangedError(f"Source was replaced by a link: {lf.relative_path}")
+            current = lf.path.stat()
+        except OSError as exc:
+            raise SourceFileChangedError(
+                f"Cannot re-inspect source file during upload: {lf.relative_path}: {exc}"
+            ) from exc
+        changed = not stat.S_ISREG(current.st_mode) or current.st_size != lf.size
+        if lf.device is not None and lf.inode is not None:
+            changed = changed or (current.st_dev, current.st_ino) != (lf.device, lf.inode)
+        if lf.mtime_ns is not None:
+            changed = changed or current.st_mtime_ns != lf.mtime_ns
+        else:
+            changed = changed or _iso_from_timestamp(current.st_mtime) != lf.mtime
+        if changed:
+            raise SourceFileChangedError(f"Source file changed during upload: {lf.relative_path}")
 
     # ------------------------------------------------------------------
     # Small-file upload
@@ -382,14 +555,39 @@ class Uploader:
         """Upload a file <= 8 MiB with a single multipart request."""
         logger.info("Uploading (small): %s (%d bytes)", lf.relative_path, lf.size)
 
-        result = self._drive.multipart_upload(
-            file_path=lf.path,
-            name=lf.path.name,
-            parent_id=parent_id,
-            created_time=lf.ctime,
-            modified_time=lf.mtime,
-        )
-        local_md5 = hashlib.md5(lf.path.read_bytes()).hexdigest()
+        # Hash before creating the Drive item so a local read failure cannot
+        # leave an uploaded file that a later size-only scan would skip.
+        local_md5 = self._file_md5(lf.path) if self._config.verify_checksum else ""
+        self._assert_source_unchanged(lf)
+        self._bandwidth_limiter.wait_for_slot(lf.size, self._quota_limit_hit)
+        if self._quota_limit_hit.is_set():
+            raise QuotaLimitError(403, "Blocking Drive quota reached")
+        try:
+            result = self._drive.multipart_upload(
+                file_path=lf.path,
+                name=lf.path.name,
+                parent_id=parent_id,
+                created_time=lf.ctime,
+                modified_time=lf.mtime,
+            )
+        except (QuotaLimitError, RateLimitError):
+            raise
+        except requests.exceptions.RequestException as exc:
+            raise AmbiguousMultipartError(
+                "small-file upload response was lost; rerun to reconcile Drive before retrying"
+            ) from exc
+        except DriveApiError as exc:
+            if exc.status == 408 or exc.status >= 500:
+                raise AmbiguousMultipartError(
+                    "small-file upload had an ambiguous server response; rerun to "
+                    "reconcile Drive before retrying"
+                ) from exc
+            raise
+        try:
+            self._assert_source_unchanged(lf)
+        except SourceFileChangedError as exc:
+            self._trash_unverified(lf, result, str(exc))
+            raise
         self._verify_md5(lf, local_md5, result)
 
         self._session_cache.remove(lf.relative_path)
@@ -402,10 +600,20 @@ class Uploader:
 
     def _upload_resumable(self, lf: LocalFile, parent_id: str) -> _WorkerResult:
         """Upload a file > 8 MiB using the resumable upload protocol."""
-        session_uri, resume_offset, resumed = self._try_resume(lf)
+        session_uri, status, resumed = self._try_resume(lf, parent_id)
+        resume_offset = status.confirmed_bytes
 
-        # Session was already completed elsewhere -- no bytes transferred this run.
-        if resume_offset == lf.size:
+        # A previous request may have completed on Drive after its local HTTP
+        # response was lost.  Verify that completed item before accepting it.
+        if status.completed is not None:
+            self._session_cache.remove(lf.relative_path)
+            try:
+                local_md5 = self._file_md5(lf.path) if self._config.verify_checksum else ""
+                self._assert_source_unchanged(lf)
+            except OSError as exc:
+                self._trash_unverified(lf, status.completed, str(exc))
+                raise
+            self._verify_md5(lf, local_md5, status.completed)
             return _WorkerResult(success=True, bytes_uploaded=0, resumed=True)
 
         if session_uri is None:
@@ -418,11 +626,18 @@ class Uploader:
             )
             self._session_cache.put(
                 lf.relative_path,
-                SessionEntry(session_uri=session_uri, file_size=lf.size, mtime=lf.mtime),
+                SessionEntry(
+                    session_uri=session_uri,
+                    file_size=lf.size,
+                    mtime=lf.mtime,
+                    source_path=str(lf.path),
+                    parent_id=parent_id,
+                    mtime_ns=lf.mtime_ns,
+                ),
             )
 
         # Stream chunks while computing MD5.
-        hasher = hashlib.md5()
+        hasher = self._new_md5() if self._config.verify_checksum else None
         chunk_size = self._config.chunk_size
         offset = 0
         resp: UploadResponse | None = None
@@ -434,73 +649,105 @@ class Uploader:
                 while remaining > 0:
                     block = f.read(min(chunk_size, remaining))
                     if not block:
-                        break
-                    hasher.update(block)
+                        raise SourceFileChangedError(
+                            f"Source file became shorter during upload: {lf.relative_path}"
+                        )
+                    if hasher is not None:
+                        hasher.update(block)
                     remaining -= len(block)
                 offset = resume_offset
 
             while offset < lf.size:
-                data = f.read(chunk_size)
+                if self._quota_limit_hit.is_set():
+                    raise QuotaLimitError(403, "Blocking Drive quota reached")
+                # Never read beyond the size declared when the resumable
+                # session was created. If the file grows concurrently, finish
+                # only the original byte range and reject it in the post-check.
+                data = f.read(min(chunk_size, lf.size - offset))
                 if not data:
-                    break
-                hasher.update(data)
+                    raise SourceFileChangedError(
+                        f"Source file became shorter during upload: {lf.relative_path}"
+                    )
+                if hasher is not None:
+                    hasher.update(data)
 
-                chunk_start = time.monotonic()
+                self._bandwidth_limiter.wait_for_slot(len(data), self._quota_limit_hit)
+                if self._quota_limit_hit.is_set():
+                    raise QuotaLimitError(403, "Blocking Drive quota reached")
                 resp = self._drive.upload_chunk(
-                    session_uri=session_uri, data=data, start=offset, total=lf.size,
+                    session_uri=session_uri,
+                    data=data,
+                    start=offset,
+                    total=lf.size,
                 )
                 offset += len(data)
 
-                if self._config.bwlimit:
-                    elapsed = time.monotonic() - chunk_start
-                    expected = len(data) / self._config.bwlimit
-                    if elapsed < expected:
-                        time.sleep(expected - elapsed)
-
         if resp is None:
-            raise DriveApiError(
-                500, f"Upload produced no completion response: {lf.relative_path}"
-            )
+            raise DriveApiError(500, f"Upload produced no completion response: {lf.relative_path}")
 
-        local_md5 = hasher.hexdigest()
+        local_md5 = hasher.hexdigest() if hasher is not None else ""
         # Remove session BEFORE verifying MD5 so a ChecksumError retry
         # doesn't find a stale "completed" session and report false success.
         self._session_cache.remove(lf.relative_path)
+        try:
+            self._assert_source_unchanged(lf)
+        except SourceFileChangedError as exc:
+            self._trash_unverified(lf, resp, str(exc))
+            raise
         self._verify_md5(lf, local_md5, resp)
 
         logger.info("Uploaded: %s (%s)", lf.relative_path, local_md5)
-        return _WorkerResult(success=True, bytes_uploaded=lf.size, resumed=resumed)
+        return _WorkerResult(
+            success=True,
+            bytes_uploaded=lf.size - resume_offset,
+            resumed=resumed,
+        )
 
-    def _try_resume(self, lf: LocalFile) -> tuple[str | None, int, bool]:
+    def _try_resume(self, lf: LocalFile, parent_id: str) -> tuple[str | None, UploadStatus, bool]:
         """Check the session cache for a resumable session.
 
-        Returns ``(session_uri, confirmed_bytes, resumed)``.  If the upload
-        was already completed (e.g. from another machine), returns
-        ``(None, file_size, True)`` so the caller can return immediately.
+        Returns ``(session_uri, status, resumed)``.  Completed status includes
+        the Drive metadata required for checksum verification.
         """
         cached = self._session_cache.get(lf.relative_path)
         if cached is None:
-            return None, 0, False
+            return None, UploadStatus(confirmed_bytes=0), False
 
-        if cached.file_size != lf.size or cached.mtime != lf.mtime:
-            logger.warning("Discarding stale session for %s (file changed)", lf.relative_path)
+        if (
+            cached.file_size != lf.size
+            or cached.mtime != lf.mtime
+            or cached.mtime_ns != lf.mtime_ns
+            or cached.source_path is None
+            or Path(cached.source_path) != lf.path
+            or cached.parent_id != parent_id
+        ):
+            # Relative path, size and mtime alone can match an unrelated tree.
+            # A session permanently targets the parent chosen at initiation.
+            logger.warning("Discarding stale or unscoped session for %s", lf.relative_path)
             self._session_cache.remove(lf.relative_path)
-            return None, 0, False
+            return None, UploadStatus(confirmed_bytes=0), False
 
         try:
-            confirmed = self._drive.query_upload_status(cached.session_uri, lf.size)
-        except DriveApiError:
-            logger.info("Stale session for %s (expired or invalid), starting fresh", lf.relative_path)
+            status = self._drive.query_upload_status(cached.session_uri, lf.size)
+        except UploadSessionError:
+            logger.info(
+                "Stale session for %s (expired or invalid), starting fresh",
+                lf.relative_path,
+            )
             self._session_cache.remove(lf.relative_path)
-            return None, 0, False
+            return None, UploadStatus(confirmed_bytes=0), False
 
-        if confirmed == lf.size:
+        if status.completed is not None:
             logger.info("Session already completed: %s", lf.relative_path)
-            self._session_cache.remove(lf.relative_path)
-            return None, lf.size, True  # signal: already done
+            return None, status, True
 
-        logger.info("Resuming %s from byte %d / %d", lf.relative_path, confirmed, lf.size)
-        return cached.session_uri, confirmed, True
+        logger.info(
+            "Resuming %s from byte %d / %d",
+            lf.relative_path,
+            status.confirmed_bytes,
+            lf.size,
+        )
+        return cached.session_uri, status, True
 
     # ------------------------------------------------------------------
     # Folder management (thread-safe)
@@ -513,10 +760,10 @@ class Uploader:
         """
         parts = relative_path.split("/")[:-1]
         if not parts:
-            return self._config.drive_folder_id
+            return self._root_folder_id
 
         current_path = ""
-        parent_id = self._config.drive_folder_id
+        parent_id = self._root_folder_id
 
         with self._folder_lock:
             for part in parts:

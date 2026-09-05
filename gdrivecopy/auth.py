@@ -11,9 +11,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+from gdrivecopy.persistence import write_text_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -48,29 +51,41 @@ def authenticate(
     creds: Credentials | None = None
 
     if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-        logger.debug("Loaded cached token from %s", token_path)
+        try:
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            logger.debug("Loaded cached token from %s", token_path)
+        except (AttributeError, OSError, TypeError, UnicodeError, ValueError) as exc:
+            # The token cache is replaceable.  Fall back to the consent flow
+            # instead of making users diagnose or manually delete a bad file.
+            logger.warning("Ignoring unreadable OAuth token cache %s: %s", token_path, exc)
 
     if creds and creds.valid:
         return creds
 
     if creds and creds.expired and creds.refresh_token:
         logger.info("Refreshing expired OAuth token")
-        creds.refresh(Request())
-    else:
+        try:
+            creds.refresh(Request())
+        except RefreshError as exc:
+            # Only revoked/expired grants call for fresh consent. Network or
+            # OAuth-client configuration failures must remain visible errors.
+            details = exc.args[1] if len(exc.args) > 1 else None
+            if not isinstance(details, dict) or details.get("error") != "invalid_grant":
+                raise
+            logger.warning("Cached OAuth authorization expired or was revoked; requesting consent")
+            creds = None
+    if creds is None or not creds.valid:
         if not credentials_path.exists():
             raise FileNotFoundError(
                 f"OAuth credentials not found at {credentials_path}. "
                 "Download them from the Google Cloud Console "
-                "(APIs & Services → Credentials → OAuth 2.0 Client ID → Download JSON)."
+                "(Google Auth Platform → Clients → Desktop app → Download JSON)."
             )
         logger.info("Starting OAuth consent flow (opening browser)")
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(credentials_path), SCOPES
-        )
+        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
         creds = flow.run_local_server(port=0)
 
-    # Persist for next run.
-    token_path.write_text(creds.to_json())
+    # Persist for next run without leaving a partially-written token behind.
+    write_text_atomic(token_path, creds.to_json())
     logger.debug("Saved token to %s", token_path)
     return creds

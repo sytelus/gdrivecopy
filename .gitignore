@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+htmlcov/
 dist/
 build/
 *.egg
@@ -10,14 +14,22 @@ venv/
 
 # OAuth credentials and tokens
 credentials.json
+credentials.json.tmp
+.credentials.json.*.tmp
 token.json
+token.json.tmp
+.token.json.*.tmp
 
 # Session cache
 sessions.json
+sessions.json.tmp
+.sessions.json.*.tmp
 
 # Logs and reports
 *.log
 report.json
+report.json.tmp
+.report.json.*.tmp
 
 # IDE
 .vscode/

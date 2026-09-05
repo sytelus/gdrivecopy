@@ -8,20 +8,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
-from gdrivecopy.drive import DriveClient, UploadResponse
+from gdrivecopy.drive import DriveClient, UploadResponse, UploadStatus
 from gdrivecopy.models import (
-    DriveFile,
     LocalFile,
-    SessionEntry,
     UploadConfig,
-    UploadStats,
 )
-
 
 # ---------------------------------------------------------------------------
 # Temporary directory with sample files
@@ -119,7 +114,7 @@ def mock_drive() -> MagicMock:
     )
 
     # query_upload_status returns 0 (nothing confirmed) by default
-    drive.query_upload_status.return_value = 0
+    drive.query_upload_status.return_value = UploadStatus(confirmed_bytes=0)
 
     # trash_file succeeds silently
     drive.trash_file.return_value = None
@@ -177,6 +172,7 @@ def make_local_file(tmp_path: Path):
             size=len(content),
             mtime=_iso_from_timestamp(stat.st_mtime),
             ctime=_iso_from_timestamp(stat.st_ctime),
+            mtime_ns=stat.st_mtime_ns,
         )
 
     return _factory
@@ -198,7 +194,7 @@ def populated_session_file(session_file: Path) -> Path:
     """Create a sessions.json with one entry and return the path."""
     data = {
         "photos/img001.jpg": {
-            "session_uri": "https://upload.example.com/session1",
+            "session_uri": "https://www.googleapis.com/upload/drive/v3/files?upload_id=session1",
             "file_size": 1024,
             "mtime": "2025-01-01T00:00:00+00:00",
         }

@@ -5,11 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from gdrivecopy.models import UploadStats
 from gdrivecopy.report import _fmt_bytes, _fmt_duration, format_report, save_report_json
-
 
 # ---------------------------------------------------------------------------
 # _fmt_bytes
@@ -83,6 +80,7 @@ class TestFormatReport:
         """The formatted report includes all key statistics."""
         stats = UploadStats(
             files_scanned=100,
+            scan_errors=4,
             files_uploaded=80,
             bytes_uploaded=1024 * 1024 * 500,
             files_resumed=5,
@@ -90,16 +88,18 @@ class TestFormatReport:
             size_mismatches=2,
             files_failed=3,
             duration_seconds=125.7,
-            daily_limit_hits=0,
+            quota_limit_hits=0,
         )
 
         report = format_report(stats)
         assert "100" in report
+        assert "Scan errors" in report
+        assert "4" in report
         assert "80" in report
-        assert "5" in report   # resumed
+        assert "5" in report  # resumed
         assert "10" in report  # skipped
-        assert "2" in report   # mismatches
-        assert "3" in report   # failed
+        assert "2" in report  # mismatches
+        assert "3" in report  # failed
 
     def test_contains_header(self) -> None:
         """The report has a header with the tool name."""
@@ -171,7 +171,7 @@ class TestSaveReportJson:
             size_mismatches=0,
             files_failed=0,
             duration_seconds=42.5,
-            daily_limit_hits=0,
+            quota_limit_hits=0,
             errors=["e1"],
             mismatch_details=["m1"],
         )
@@ -181,15 +181,19 @@ class TestSaveReportJson:
         data = json.loads(path.read_text(encoding="utf-8"))
         expected_keys = {
             "files_scanned",
+            "files_excluded",
+            "scan_errors",
             "symlinks_skipped",
+            "files_to_upload",
             "files_uploaded",
             "bytes_uploaded",
             "files_resumed",
             "files_skipped",
             "size_mismatches",
+            "path_conflicts",
             "files_failed",
             "duration_seconds",
-            "daily_limit_hits",
+            "quota_limit_hits",
             "errors",
             "mismatch_details",
         }
@@ -227,3 +231,12 @@ class TestSaveReportJson:
 
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["files_scanned"] == 99
+
+    def test_creates_parent_and_leaves_no_temp_file(self, tmp_path: Path) -> None:
+        """Report persistence is atomic and supports a new output directory."""
+        path = tmp_path / "logs" / "report.json"
+
+        save_report_json(UploadStats(scan_errors=2), path)
+
+        assert json.loads(path.read_text(encoding="utf-8"))["scan_errors"] == 2
+        assert not path.with_name("report.json.tmp").exists()
