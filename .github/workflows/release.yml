@@ -87,7 +87,7 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           python -c "import os; from gdrivecopy import __version__; assert os.environ['RELEASE_TAG'] == 'v' + __version__, 'Tag must match package version'"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
