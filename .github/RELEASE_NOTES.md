@@ -1,5 +1,22 @@
-Copy folders to and from Google My Drive with a live terminal dashboard,
-checksum verification, named accounts, and durable cancellation/resume.
+This patch release improves copy recovery, diagnostic privacy, and error reporting.
+
+## What's fixed
+
+- Protect unrelated files and previously completed uploads from unsafe cleanup.
+- Reject recovered folders that moved, changed, or went to trash.
+- Rebuild interrupted plans and recover inventory cursors without losing changes.
+- Preserve fast size-only skips on resume and pause cleanly on quota errors.
+- Strengthen account/path validation and secret redaction in errors and logs.
+- Show source scan failures, handle damaged job listings, and record accurate build provenance.
+
+Adds 41 test cases. Source checks pass on Windows/Linux with Python 3.10 and 3.14;
+native packages also run tests and offline installation checks on their build platforms.
+
+## Upgrading from 0.2.0
+
+Existing accounts and saved jobs remain compatible. Stop the app, extract the
+new binary archive into its own folder, and resume the original job. Retain
+the state directory and partial downloads; pass your original `--state-dir` if customized.
 
 ## Downloads
 
@@ -27,9 +44,9 @@ gdrivecopy doctor
 ```
 
 For native builds, use the executable prefix described above. See the
-[quick start](https://github.com/sytelus/gdrivecopy#readme),
-[user guide](https://github.com/sytelus/gdrivecopy/blob/main/USAGE.md), and
-[changelog](https://github.com/sytelus/gdrivecopy/blob/main/CHANGELOG.md).
+[quick start](https://github.com/sytelus/gdrivecopy/tree/v0.2.1#readme),
+[user guide](https://github.com/sytelus/gdrivecopy/blob/v0.2.1/USAGE.md), and
+[changelog](https://github.com/sytelus/gdrivecopy/blob/v0.2.1/CHANGELOG.md).
 
 ## Integrity and compatibility
 
