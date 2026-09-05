@@ -42,7 +42,9 @@ def write_notices(bundle: Path) -> None:
     notices = bundle / "licenses"
     notices.mkdir(exist_ok=True)
     versions = {}
-    for dist in runtime_distributions():
+    # The frozen executable also redistributes PyInstaller's bootloader, whose
+    # license/exception is required even though it is not an app dependency.
+    for dist in [*runtime_distributions(), metadata.distribution("pyinstaller")]:
         name = canonicalize_name(dist.metadata["Name"])
         versions[name] = dist.version
         texts = []
@@ -64,14 +66,18 @@ def write_notices(bundle: Path) -> None:
     url = f"https://raw.githubusercontent.com/python/cpython/v{platform.python_version()}/LICENSE"
     with urllib.request.urlopen(url, timeout=30) as response:
         (notices / "python.txt").write_bytes(response.read())
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = None  # Source archives have no .git directory.
     info = {
         "version": metadata.version("gdrivecopy"),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "architecture": platform.machine(),
-        "commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-        ).strip(),
+        "commit": commit,
         "dependencies": dict(sorted(versions.items())),
     }
     (bundle / "BUILD_INFO.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
@@ -117,6 +123,10 @@ def main() -> None:
         "OPERATIONS.md",
         "SECURITY.md",
         "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "CODE_OF_CONDUCT.md",
+        "DEVELOPMENT.md",
+        "PRD.md",
     ):
         shutil.copy2(ROOT / name, bundle / name)
     write_notices(bundle)
