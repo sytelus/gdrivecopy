@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible problem with a copy, resume, install, or report.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "Do not attach tokens, client JSON, job databases or resumable URLs. Redact filenames/emails. Report vulnerabilities through the Security tab."
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: App version, OS, install method, and gdrivecopy doctor --json output.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include a redacted command and, if possible, synthetic example files.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted errors or report excerpt
+      render: text

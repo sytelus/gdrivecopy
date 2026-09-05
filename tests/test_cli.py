@@ -31,10 +31,10 @@ class TestParser:
     @pytest.mark.parametrize(
         "arguments",
         [
-            ["upload", ".", "   "],
-            ["upload", ".", "folder", "--transfers", "0"],
-            ["upload", ".", "folder", "--bwlimit", "0"],
-            ["upload", ".", "folder", "--chunk-size", "255K"],
+            ["legacy-upload", ".", "   "],
+            ["legacy-upload", ".", "folder", "--transfers", "0"],
+            ["legacy-upload", ".", "folder", "--bwlimit", "0"],
+            ["legacy-upload", ".", "folder", "--chunk-size", "255K"],
         ],
     )
     def test_invalid_numeric_options_exit_cleanly(self, arguments: list[str]) -> None:
@@ -80,7 +80,7 @@ class TestUploadCommand:
 
         main(
             [
-                "upload",
+                "legacy-upload",
                 str(tmp_path),
                 "folder-id",
                 "--transfers",
@@ -129,7 +129,7 @@ class TestUploadCommand:
         with patch("gdrivecopy.uploader.Uploader") as uploader_cls:
             uploader_cls.return_value.run.return_value = stats
             with pytest.raises(SystemExit) as exc_info:
-                main(["upload", str(tmp_path), "folder-id"])
+                main(["legacy-upload", str(tmp_path), "folder-id"])
 
         assert exc_info.value.code == 1
 
@@ -138,7 +138,7 @@ class TestUploadCommand:
             patch("gdrivecopy.auth.authenticate") as mock_authenticate,
             pytest.raises(SystemExit) as exc_info,
         ):
-            main(["upload", str(tmp_path / "missing"), "folder-id"])
+            main(["legacy-upload", str(tmp_path / "missing"), "folder-id"])
 
         assert exc_info.value.code == 2
         mock_authenticate.assert_not_called()
@@ -157,7 +157,7 @@ class TestUploadCommand:
         mock_authenticate.side_effect = DriveApiError(403, "denied")
 
         with pytest.raises(SystemExit) as exc_info:
-            main(["upload", str(tmp_path), "folder-id", "--quiet"])
+            main(["legacy-upload", str(tmp_path), "folder-id", "--quiet"])
 
         assert exc_info.value.code == 1
         assert "upload aborted: denied" in capsys.readouterr().err

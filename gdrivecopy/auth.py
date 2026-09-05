@@ -29,6 +29,8 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 def authenticate(
     credentials_path: Path = Path("credentials.json"),
     token_path: Path = Path("token.json"),
+    *,
+    select_account: bool = False,
 ) -> Credentials:
     """Return valid Google OAuth 2.0 credentials.
 
@@ -83,7 +85,8 @@ def authenticate(
             )
         logger.info("Starting OAuth consent flow (opening browser)")
         flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
-        creds = flow.run_local_server(port=0)
+        options = {"prompt": "select_account consent"} if select_account else {}
+        creds = flow.run_local_server(port=0, **options)
 
     # Persist for next run without leaving a partially-written token behind.
     write_text_atomic(token_path, creds.to_json())

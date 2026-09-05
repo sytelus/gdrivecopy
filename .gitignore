@@ -30,6 +30,14 @@ sessions.json.tmp
 report.json
 report.json.tmp
 .report.json.*.tmp
+accounts.json
+accounts.lock
+job.sqlite3*
+run.lock
+files.csv
+.files.csv.*.tmp
+*.log.*
+.gdrivecopy-*.parts/
 
 # IDE
 .vscode/

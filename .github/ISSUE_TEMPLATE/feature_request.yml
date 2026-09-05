@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest an improvement to gdrivecopy.
+title: "[Feature] "
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What are you trying to do?
+      description: Describe the user problem and any current workaround.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested behavior
+      description: Include relevant correctness, performance, or compatibility tradeoffs.

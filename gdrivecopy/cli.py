@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from gdrivecopy import __version__
+from gdrivecopy.commands import HelpParser, add_commands
 from gdrivecopy.models import UploadConfig
 
 
@@ -59,15 +60,21 @@ def _nonempty(value: str) -> str:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = HelpParser(
         prog="gdrivecopy",
-        description="Fast, resilient bulk upload utility for Google Drive.",
+        description="Fast, resilient folder copies between your computer and Google Drive.",
+        epilog="Start: gdrivecopy accounts add personal | Copy: gdrivecopy copy --help | Recover: gdrivecopy resume JOB_ID",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(
+        dest="command", parser_class=HelpParser, title="Commands", metavar="COMMAND"
+    )
+    add_commands(sub, _parse_size, _positive_int)
 
     # -- upload ---------------------------------------------------------
-    upload = sub.add_parser("upload", help="Upload files to Google Drive")
+    upload = sub.add_parser(
+        "legacy-upload", help="Compatibility: v0.1 upload with JSON sessions (prefer copy)"
+    )
     upload.add_argument("source_dir", type=Path, help="Local directory to upload")
     upload.add_argument("drive_folder_id", type=_nonempty, help="Google Drive folder ID (target)")
 
@@ -136,7 +143,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # -- auth -----------------------------------------------------------
-    auth = sub.add_parser("auth", help="Run OAuth flow and cache token")
+    auth = sub.add_parser("auth", help="Compatibility: cache a v0.1 token (prefer accounts add)")
     auth.add_argument(
         "--credentials",
         type=Path,
@@ -180,6 +187,9 @@ def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     try:
         _main(argv)
+    except KeyboardInterrupt:
+        print("gdrivecopy: cancelled", file=sys.stderr)
+        sys.exit(130)
     except OSError as exc:
         # Includes log setup, token persistence and final report failures,
         # which can happen outside the upload exception boundary below.
@@ -206,6 +216,42 @@ def _main(argv: list[str] | None = None) -> None:
         parser.print_help()
         sys.exit(1)
 
+    if args.command in {
+        "copy",
+        "upload",
+        "download",
+        "resume",
+        "accounts",
+        "jobs",
+        "report",
+        "doctor",
+    }:
+        from sqlite3 import Error as SQLiteError
+
+        from google.auth.exceptions import GoogleAuthError
+        from googleapiclient.errors import HttpError
+        from requests.exceptions import RequestException
+
+        from gdrivecopy.commands import execute
+        from gdrivecopy.drive import DriveApiError
+
+        try:
+            code = execute(args)
+        except (
+            ValueError,
+            RuntimeError,
+            GoogleAuthError,
+            HttpError,
+            DriveApiError,
+            RequestException,
+            SQLiteError,
+        ) as exc:
+            print(f"gdrivecopy: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if code:
+            sys.exit(code)
+        return
+
     if args.command == "auth":
         _validate_state_paths(parser, [args.credentials, args.token])
         _setup_logging(Path("."), "INFO", quiet=False)
@@ -221,7 +267,7 @@ def _main(argv: list[str] | None = None) -> None:
         print(f"Authentication successful. Token saved to {args.token}")
         return
 
-    if args.command == "upload":
+    if args.command == "legacy-upload":
         chunk_size = args.chunk_size
         if chunk_size < 256 * 1024 or chunk_size % (256 * 1024) != 0:
             parser.error("--chunk-size must be a multiple of 256K (minimum 256K)")

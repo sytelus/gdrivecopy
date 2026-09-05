@@ -1,3 +1,3 @@
-"""gdrivecopy -- Fast, resilient bulk upload utility for Google Drive."""
+"""gdrivecopy -- Fast, resilient copies between local folders and Google Drive."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

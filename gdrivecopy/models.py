@@ -83,6 +83,7 @@ class UploadConfig:
     log_dir: Path = field(default_factory=lambda: Path("."))
     log_path: Path | None = None
     log_level: str = "INFO"
+    retries: int = 8
 
 
 @dataclass(slots=True)

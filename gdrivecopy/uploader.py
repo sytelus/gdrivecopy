@@ -34,6 +34,7 @@ from typing import Any
 import requests.exceptions
 from googleapiclient.errors import HttpError
 
+from gdrivecopy.control import RunControl
 from gdrivecopy.drive import (
     MULTIPART_THRESHOLD,
     DriveApiError,
@@ -89,6 +90,8 @@ class _WorkerResult:
     resumed: bool = False
     error: str | None = None
     is_permanent: bool = False
+    file_id: str | None = None
+    md5_checksum: str | None = None
 
 
 # ------------------------------------------------------------------
@@ -164,7 +167,17 @@ class Uploader:
         drive: Authenticated Drive API client.
     """
 
-    def __init__(self, config: UploadConfig, drive: DriveClient) -> None:
+    def __init__(
+        self,
+        config: UploadConfig,
+        drive: DriveClient,
+        *,
+        control: RunControl | None = None,
+        sessions=None,
+        folder_map=None,
+        reserve_id=None,
+        discard_id=None,
+    ) -> None:
         if not config.drive_folder_id.strip():
             raise ValueError("drive_folder_id must not be empty")
         if config.transfers < 1:
@@ -176,7 +189,11 @@ class Uploader:
 
         self._config = config
         self._drive = drive
-        self._session_cache = SessionCache(config.session_path)
+        self._session_cache = (
+            sessions if sessions is not None else SessionCache(config.session_path)
+        )
+        self.control = control
+        self._reserve_id, self._discard_id = reserve_id, discard_id
         self._stats = UploadStats()
         self._breaker = _CircuitBreaker()
         self._bandwidth_limiter = _BandwidthLimiter(config.bwlimit)
@@ -184,7 +201,7 @@ class Uploader:
 
         # Populated during Phase 1, guarded by _folder_lock for writes.
         self._file_map: dict[str, DriveFile] = {}
-        self._folder_map: dict[str, str] = {}
+        self._folder_map = folder_map if folder_map is not None else {}
         self._folder_lock = threading.Lock()
         self._root_folder_id = config.drive_folder_id
 
@@ -386,7 +403,9 @@ class Uploader:
         Returns a ``_WorkerResult`` -- never mutates ``self._stats``.
         """
         auth_retried = False
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(self._config.retries):
+            if self.control is not None:
+                self.control.check()
             if self._quota_limit_hit.is_set():
                 raise QuotaLimitError(403, "Blocking Drive quota reached")
             try:
@@ -457,20 +476,29 @@ class Uploader:
             logger.error(message)
             return message
 
-    @staticmethod
-    def _backoff(lf: LocalFile, attempt: int, exc: Exception) -> None:
-        if attempt + 1 >= MAX_RETRIES:
+    def _backoff(self, lf: LocalFile, attempt: int, exc: Exception) -> None:
+        if attempt + 1 >= self._config.retries:
             return  # No pointless sleep after the final failed attempt.
         delay = min(60, 2**attempt) * random.random()
         logger.warning(
             "%s (attempt %d/%d), backing off %.1fs: %s",
             lf.relative_path,
             attempt + 1,
-            MAX_RETRIES,
+            self._config.retries,
             delay,
             exc,
         )
-        time.sleep(delay)
+        if self.control:
+            self.control.emit(
+                "retry",
+                lf.relative_path,
+                attempt=attempt + 1,
+                delay=delay,
+                message=type(exc).__name__,
+            )
+            self.control.wait(delay)
+        else:
+            time.sleep(delay)
 
     def _upload_one_attempt(self, lf: LocalFile) -> _WorkerResult:
         """Single upload attempt."""
@@ -511,18 +539,21 @@ class Uploader:
             raise CleanupError(
                 f"{reason}; could not trash Drive item {response.file_id}: {exc}"
             ) from exc
+        if self._discard_id is not None:
+            self._discard_id(lf)
 
     @staticmethod
     def _new_md5() -> Any:
         """Create an MD5 hasher for Drive integrity checks, not security."""
         return hashlib.md5(usedforsecurity=False)
 
-    @classmethod
-    def _file_md5(cls, path: Path) -> str:
+    def _file_md5(self, path: Path) -> str:
         """Hash a local file without loading a second full copy into memory."""
-        hasher = cls._new_md5()
+        hasher = self._new_md5()
         with path.open("rb") as file_obj:
             for block in iter(lambda: file_obj.read(1024 * 1024), b""):
+                if self.control is not None:
+                    self.control.check()
                 hasher.update(block)
         return hasher.hexdigest()
 
@@ -559,7 +590,11 @@ class Uploader:
         # leave an uploaded file that a later size-only scan would skip.
         local_md5 = self._file_md5(lf.path) if self._config.verify_checksum else ""
         self._assert_source_unchanged(lf)
-        self._bandwidth_limiter.wait_for_slot(lf.size, self._quota_limit_hit)
+        self._bandwidth_limiter.wait_for_slot(
+            lf.size, self.control.stop if self.control else self._quota_limit_hit
+        )
+        if self.control is not None:
+            self.control.check()
         if self._quota_limit_hit.is_set():
             raise QuotaLimitError(403, "Blocking Drive quota reached")
         try:
@@ -569,15 +604,20 @@ class Uploader:
                 parent_id=parent_id,
                 created_time=lf.ctime,
                 modified_time=lf.mtime,
+                **({"file_id": self._reserve_id(lf)} if self._reserve_id else {}),
             )
         except (QuotaLimitError, RateLimitError):
             raise
         except requests.exceptions.RequestException as exc:
+            if self._reserve_id is not None:
+                raise  # Replaying the same durable ID cannot create a duplicate.
             raise AmbiguousMultipartError(
                 "small-file upload response was lost; rerun to reconcile Drive before retrying"
             ) from exc
         except DriveApiError as exc:
             if exc.status == 408 or exc.status >= 500:
+                if self._reserve_id is not None:
+                    raise
                 raise AmbiguousMultipartError(
                     "small-file upload had an ambiguous server response; rerun to "
                     "reconcile Drive before retrying"
@@ -592,7 +632,16 @@ class Uploader:
 
         self._session_cache.remove(lf.relative_path)
         logger.info("Uploaded: %s", lf.relative_path)
-        return _WorkerResult(success=True, bytes_uploaded=lf.size)
+        if self.control:
+            self.control.emit(
+                "progress", lf.relative_path, offset=lf.size, size=lf.size, bytes=lf.size
+            )
+        return _WorkerResult(
+            success=True,
+            bytes_uploaded=lf.size,
+            file_id=result.file_id,
+            md5_checksum=result.md5_checksum,
+        )
 
     # ------------------------------------------------------------------
     # Resumable upload
@@ -614,16 +663,43 @@ class Uploader:
                 self._trash_unverified(lf, status.completed, str(exc))
                 raise
             self._verify_md5(lf, local_md5, status.completed)
-            return _WorkerResult(success=True, bytes_uploaded=0, resumed=True)
+            return _WorkerResult(
+                success=True,
+                bytes_uploaded=0,
+                resumed=True,
+                file_id=status.completed.file_id,
+                md5_checksum=status.completed.md5_checksum,
+            )
 
         if session_uri is None:
-            session_uri = self._drive.initiate_resumable_upload(
-                name=lf.path.name,
-                parent_id=parent_id,
-                file_size=lf.size,
-                created_time=lf.ctime,
-                modified_time=lf.mtime,
-            )
+            reserved_id = self._reserve_id(lf) if self._reserve_id else None
+            try:
+                session_uri = self._drive.initiate_resumable_upload(
+                    name=lf.path.name,
+                    parent_id=parent_id,
+                    file_size=lf.size,
+                    created_time=lf.ctime,
+                    modified_time=lf.mtime,
+                    **({"file_id": reserved_id} if reserved_id else {}),
+                )
+            except DriveApiError as exc:
+                if exc.status != 409 or reserved_id is None:
+                    raise
+                completed = self._drive.upload_result(reserved_id)
+                try:
+                    digest = self._file_md5(lf.path) if self._config.verify_checksum else ""
+                    self._assert_source_unchanged(lf)
+                except OSError as error:
+                    self._trash_unverified(lf, completed, str(error))
+                    raise
+                self._verify_md5(lf, digest, completed)
+                self._session_cache.remove(lf.relative_path)
+                return _WorkerResult(
+                    success=True,
+                    resumed=True,
+                    file_id=completed.file_id,
+                    md5_checksum=completed.md5_checksum,
+                )
             self._session_cache.put(
                 lf.relative_path,
                 SessionEntry(
@@ -645,8 +721,12 @@ class Uploader:
         with open(lf.path, "rb") as f:
             # Hash the already-uploaded portion for MD5 continuity.
             if resume_offset > 0:
-                remaining = resume_offset
+                remaining = resume_offset if hasher is not None else 0
+                if hasher is None:
+                    f.seek(resume_offset)
                 while remaining > 0:
+                    if self.control:
+                        self.control.check()
                     block = f.read(min(chunk_size, remaining))
                     if not block:
                         raise SourceFileChangedError(
@@ -655,9 +735,19 @@ class Uploader:
                     if hasher is not None:
                         hasher.update(block)
                     remaining -= len(block)
+                    if self.control:
+                        self.control.emit(
+                            "progress",
+                            lf.relative_path,
+                            offset=resume_offset - remaining,
+                            size=lf.size,
+                            status="Checking resume data",
+                        )
                 offset = resume_offset
 
             while offset < lf.size:
+                if self.control:
+                    self.control.check()
                 if self._quota_limit_hit.is_set():
                     raise QuotaLimitError(403, "Blocking Drive quota reached")
                 # Never read beyond the size declared when the resumable
@@ -671,7 +761,11 @@ class Uploader:
                 if hasher is not None:
                     hasher.update(data)
 
-                self._bandwidth_limiter.wait_for_slot(len(data), self._quota_limit_hit)
+                self._bandwidth_limiter.wait_for_slot(
+                    len(data), self.control.stop if self.control else self._quota_limit_hit
+                )
+                if self.control:
+                    self.control.check()
                 if self._quota_limit_hit.is_set():
                     raise QuotaLimitError(403, "Blocking Drive quota reached")
                 resp = self._drive.upload_chunk(
@@ -681,6 +775,15 @@ class Uploader:
                     total=lf.size,
                 )
                 offset += len(data)
+                if self.control:
+                    self.control.emit(
+                        "progress",
+                        lf.relative_path,
+                        offset=offset,
+                        size=lf.size,
+                        bytes=len(data),
+                        status="Uploading",
+                    )
 
         if resp is None:
             raise DriveApiError(500, f"Upload produced no completion response: {lf.relative_path}")
@@ -701,6 +804,8 @@ class Uploader:
             success=True,
             bytes_uploaded=lf.size - resume_offset,
             resumed=resumed,
+            file_id=resp.file_id,
+            md5_checksum=resp.md5_checksum,
         )
 
     def _try_resume(self, lf: LocalFile, parent_id: str) -> tuple[str | None, UploadStatus, bool]:
@@ -776,3 +881,7 @@ class Uploader:
                     logger.info("Created folder: %s", current_path)
 
         return parent_id
+
+    def upload_file(self, local_file: LocalFile) -> _WorkerResult:
+        """Transfer one manifest item; the job runner owns scheduling and reports."""
+        return self._upload_one(local_file)

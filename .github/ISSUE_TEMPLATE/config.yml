@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Private security report
+    url: https://github.com/sytelus/gdrivecopy/security/advisories/new
+    about: Report vulnerabilities privately; never post tokens or job databases in an issue.

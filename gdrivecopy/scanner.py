@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import stat as stat_module
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,7 +60,14 @@ class ScanResult:
     files_excluded: int = 0
 
 
-def scan_local(source_dir: Path, excluded_paths: Collection[Path] = ()) -> ScanResult:
+def scan_local(
+    source_dir: Path,
+    excluded_paths: Collection[Path] = (),
+    *,
+    on_file: Callable[[LocalFile], None] | None = None,
+    excluded_directories: Collection[Path] = (),
+    check_cancel: Callable[[], None] | None = None,
+) -> ScanResult:
     """Walk *source_dir* recursively and return all regular files.
 
     - Symlinks are skipped (logged at WARNING level) and counted.
@@ -91,6 +98,7 @@ def scan_local(source_dir: Path, excluded_paths: Collection[Path] = ()) -> ScanR
     files_excluded = 0
     errors: list[str] = []
     excluded = {path.resolve() for path in excluded_paths}
+    excluded_dirs = {path.resolve() for path in excluded_directories}
     temp_prefixes: dict[Path, tuple[str, ...]] = {}
     for parent in {path.parent for path in excluded}:
         temp_prefixes[parent] = tuple(
@@ -110,6 +118,8 @@ def scan_local(source_dir: Path, excluded_paths: Collection[Path] = ()) -> ScanR
     for dirpath, dirnames, filenames in os.walk(
         source_dir, followlinks=False, onerror=_record_walk_error
     ):
+        if check_cancel:
+            check_cancel()
         dirnames.sort()
         filenames.sort()
 
@@ -118,6 +128,10 @@ def scan_local(source_dir: Path, excluded_paths: Collection[Path] = ()) -> ScanR
         # count them explicitly so the report accounts for every skipped link.
         for dirname in list(dirnames):
             full_path = Path(dirpath) / dirname
+            if full_path in excluded_dirs:
+                dirnames.remove(dirname)
+                files_excluded += 1
+                continue
             try:
                 link_like = _is_link_like(full_path)
             except OSError as exc:
@@ -134,6 +148,8 @@ def scan_local(source_dir: Path, excluded_paths: Collection[Path] = ()) -> ScanR
                 dirnames.remove(dirname)
 
         for fname in filenames:
+            if check_cancel:
+                check_cancel()
             full_path = Path(dirpath) / fname
 
             if full_path in excluded or (
@@ -168,18 +184,20 @@ def scan_local(source_dir: Path, excluded_paths: Collection[Path] = ()) -> ScanR
                 errors.append(message)
                 continue
 
-            files.append(
-                LocalFile(
-                    path=full_path,
-                    relative_path=full_path.relative_to(source_dir).as_posix(),
-                    size=stat.st_size,
-                    mtime=mtime,
-                    ctime=ctime,
-                    mtime_ns=stat.st_mtime_ns,
-                    device=stat.st_dev,
-                    inode=stat.st_ino,
-                )
+            item = LocalFile(
+                path=full_path,
+                relative_path=full_path.relative_to(source_dir).as_posix(),
+                size=stat.st_size,
+                mtime=mtime,
+                ctime=ctime,
+                mtime_ns=stat.st_mtime_ns,
+                device=stat.st_dev,
+                inode=stat.st_ino,
             )
+            if on_file:
+                on_file(item)
+            else:
+                files.append(item)
 
     return ScanResult(
         files=files,

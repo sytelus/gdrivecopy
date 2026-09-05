@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import quote
 
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import AuthorizedSession, Request
@@ -30,7 +31,9 @@ from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 from httplib2 import HttpLib2Error
 from requests.exceptions import RequestException
+from urllib3.exceptions import HTTPError as Urllib3Error
 
+from gdrivecopy.control import RunControl
 from gdrivecopy.models import DriveFile
 from gdrivecopy.session import validate_session_uri
 
@@ -130,7 +133,9 @@ def _escape_query_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _retry_transient(func: Callable[[], T], description: str = "") -> T:
+def _retry_transient(
+    func: Callable[[], T], description: str = "", control: RunControl | None = None
+) -> T:
     """Call *func* with retries on transient Google API errors.
 
     Handles both ``HttpError`` (from the discovery client) and
@@ -138,6 +143,8 @@ def _retry_transient(func: Callable[[], T], description: str = "") -> T:
     immediately.
     """
     for attempt in range(1, _MAX_API_ATTEMPTS + 1):
+        if control:
+            control.check()
         try:
             return func()
         except HttpError as exc:
@@ -166,7 +173,11 @@ def _retry_transient(func: Callable[[], T], description: str = "") -> T:
             delay,
             error,
         )
-        time.sleep(delay)
+        if control:
+            control.emit("retry", message=f"Retrying {description}", attempt=attempt, delay=delay)
+            control.wait(delay)
+        else:
+            time.sleep(delay)
 
     raise AssertionError("retry loop exited unexpectedly")
 
@@ -252,9 +263,13 @@ class DriveClient:
         self._http_local = threading.local()
         self._folder_creation_lock = threading.Lock()
         self._folder_ids: dict[tuple[str, str], str] = {}
+        self.control: RunControl | None = None
         # ``requests.Session`` instances are not guaranteed to be thread-safe,
         # so each upload worker gets its own authorized session.
         self._http_local.session = self._new_http_session()
+
+    def _retry(self, operation, description=""):
+        return _retry_transient(operation, description, self.control)
 
     def _new_http_session(self) -> AuthorizedSession:
         """Create a minimally retrying HTTP session for the current thread."""
@@ -273,7 +288,180 @@ class DriveClient:
     def _execute_service_request(self, request_factory: Callable[[], T]) -> T:
         """Run one discovery-client request under its thread-safety lock."""
         with self._service_lock:
+            if self.control is not None:
+                self.control.check()
             return request_factory()
+
+    def account_info(self) -> dict:
+        """Return server-confirmed account identity, never infer it from a filename."""
+        response = self._retry(
+            lambda: self._execute_service_request(
+                lambda: (
+                    self._service.about()
+                    .get(fields="user(displayName,emailAddress,permissionId),storageQuota")
+                    .execute()
+                )
+            ),
+            "identifying account",
+        )
+        user = response.get("user", {})
+        _required_string(user.get("emailAddress"), "account email")
+        _required_string(user.get("permissionId"), "account identity")
+        return response
+
+    def file_metadata(self, file_id: str) -> dict:
+        return self._retry(
+            lambda: self._execute_service_request(
+                lambda: (
+                    self._service.files()
+                    .get(
+                        fileId=file_id,
+                        fields=(
+                            "id,name,mimeType,size,md5Checksum,modifiedTime,createdTime,version,parents,"
+                            "trashed,driveId,capabilities(canDownload)"
+                        ),
+                    )
+                    .execute()
+                )
+            ),
+            "reading file metadata",
+        )
+
+    def folder_page(self, folder_id: str, token: str | None = None) -> dict:
+        """One checkpointable listing page, shared by initial and incremental scans."""
+        response = self._retry(
+            lambda: self._execute_service_request(
+                lambda: (
+                    self._service.files()
+                    .list(
+                        q=f"'{_escape_query_literal(folder_id)}' in parents and trashed=false",
+                        pageSize=1000,
+                        pageToken=token,
+                        fields=(
+                            "nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum,"
+                            "modifiedTime,createdTime,version,parents,capabilities(canDownload))"
+                        ),
+                    )
+                    .execute()
+                )
+            ),
+            "scanning folder",
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("files", []), list):
+            raise DriveApiError(502, "Invalid Drive listing page")
+        if response.get("incompleteSearch"):
+            raise DriveApiError(502, "Drive returned an incomplete search")
+        return response
+
+    def change_token(self) -> str:
+        result = self._retry(
+            lambda: self._execute_service_request(
+                lambda: self._service.changes().getStartPageToken().execute()
+            ),
+            "starting Drive change tracking",
+        )
+        return _required_string(result.get("startPageToken"), "change token")
+
+    def change_page(self, token: str) -> dict:
+        return self._retry(
+            lambda: self._execute_service_request(
+                lambda: (
+                    self._service.changes()
+                    .list(
+                        pageToken=token,
+                        pageSize=1000,
+                        includeRemoved=True,
+                        fields="nextPageToken,newStartPageToken,changes(fileId,removed,file(id,parents,trashed,mimeType))",
+                    )
+                    .execute()
+                )
+            ),
+            "refreshing Drive changes",
+        )
+
+    def generate_ids(self, count: int = 100) -> list[str]:
+        result = self._retry(
+            lambda: self._execute_service_request(
+                lambda: self._service.files().generateIds(count=count, space="drive").execute()
+            ),
+            "reserving upload identities",
+        )
+        ids = result.get("ids")
+        if (
+            not isinstance(ids, list)
+            or len(ids) != count
+            or any(not isinstance(value, str) for value in ids)
+            or len(set(ids)) != count
+        ):
+            raise DriveApiError(502, "Drive returned invalid generated IDs")
+        return [_required_string(value, "generated ID") for value in ids]
+
+    def upload_result(self, file_id: str) -> UploadResponse:
+        metadata = self.file_metadata(file_id)
+        if metadata.get("trashed"):
+            raise DriveApiError(409, "Reserved upload is in trash; recovery requires review")
+        return UploadResponse(
+            _required_string(metadata.get("id"), "file ID"), metadata.get("md5Checksum")
+        )
+
+    def download_range(self, file_id: str, start: int, length: int, total: int) -> bytes:
+        """Fetch and validate one bounded binary range without transparent decoding."""
+        if not 0 <= start < total or length <= 0:
+            raise ValueError("Invalid download range")
+        end = min(total, start + length) - 1
+        if self.control:
+            self.control.check()
+        with self._http_session().get(
+            f"https://www.googleapis.com/drive/v3/files/{quote(file_id, safe='')}?alt=media",
+            headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"},
+            timeout=_HTTP_TIMEOUT,
+            allow_redirects=False,
+            stream=True,
+        ) as response:
+            self._check_errors(response)
+            expected = end - start + 1
+            if response.status_code == 206:
+                if response.headers.get("Content-Range") != f"bytes {start}-{end}/{total}":
+                    raise DriveApiError(502, "Invalid download Content-Range")
+            elif response.status_code != 200 or start != 0 or expected != total:
+                raise DriveApiError(502, "Drive ignored the requested download range")
+            if response.headers.get("Content-Encoding", "identity") != "identity":
+                raise DriveApiError(502, "Unexpected compressed download response")
+            try:
+                payload = response.raw.read(expected + 1, decode_content=False)
+            except Urllib3Error as exc:
+                raise RequestException("Download connection interrupted") from exc
+            if len(payload) != expected:
+                raise DriveApiError(502, "Download response length did not match its range")
+            return payload
+
+    def export_document(self, file_id: str, mime_type: str) -> bytes:
+        """Export Google-native content; exports have no byte-range resume or Drive MD5."""
+        with self._http_session().get(
+            f"https://www.googleapis.com/drive/v3/files/{quote(file_id, safe='')}/export",
+            params={"mimeType": mime_type},
+            headers={"Accept-Encoding": "identity"},
+            timeout=_HTTP_TIMEOUT,
+            allow_redirects=False,
+            stream=True,
+        ) as response:
+            self._check_errors(response)
+            if response.status_code != 200:
+                raise DriveApiError(502, "Unexpected export response")
+            if response.headers.get("Content-Encoding", "identity") != "identity":
+                raise DriveApiError(502, "Unexpected compressed export response")
+            try:
+                content = response.raw.read(10 * 1024 * 1024 + 1, decode_content=False)
+            except Urllib3Error as exc:
+                raise RequestException("Export connection interrupted") from exc
+            if len(content) > 10 * 1024 * 1024:
+                raise DriveApiError(
+                    400, "Google document export exceeds the supported 10 MiB limit"
+                )
+            length = response.headers.get("Content-Length")
+            if length is not None and (not str(length).isdigit() or int(length) != len(content)):
+                raise DriveApiError(502, "Export response length did not match Content-Length")
+            return content
 
     def refresh_credentials(self) -> None:
         """Refresh OAuth credentials, serializing concurrent 401 recovery."""
@@ -292,7 +480,7 @@ class DriveClient:
             ``relative_path -> DriveFile`` and *folder_map* maps
             ``relative_path/ -> drive_folder_id``.
         """
-        root = _retry_transient(
+        root = self._retry(
             lambda: self._execute_service_request(
                 lambda: (
                     self._service.files()
@@ -324,7 +512,7 @@ class DriveClient:
         page_token: str | None = None
         seen_tokens: set[str] = set()
         while True:
-            resp = _retry_transient(
+            resp = self._retry(
                 lambda pt=page_token: self._execute_service_request(
                     lambda: (
                         self._service.files()
@@ -444,7 +632,7 @@ class DriveClient:
 
         key = (parent_id, name)
         if key not in self._folder_ids:
-            result = _retry_transient(
+            result = self._retry(
                 lambda: self._execute_service_request(
                     lambda: self._service.files().generateIds(count=1, space="drive").execute()
                 ),
@@ -494,9 +682,12 @@ class DriveClient:
         mime_type: str | None = None,
         created_time: str | None = None,
         modified_time: str | None = None,
+        file_id: str | None = None,
     ) -> str:
         """Start a resumable upload session and return the session URI."""
         metadata = _file_metadata(name, parent_id, created_time, modified_time)
+        if file_id is not None:
+            metadata["id"] = file_id
         resp = self._http_session().post(
             f"{UPLOAD_URL}?uploadType=resumable&fields=id,md5Checksum",
             headers={
@@ -634,9 +825,12 @@ class DriveClient:
         mime_type: str | None = None,
         created_time: str | None = None,
         modified_time: str | None = None,
+        file_id: str | None = None,
     ) -> UploadResponse:
         """Upload a small file (≤ 8 MiB) in a single multipart request."""
         metadata = _file_metadata(name, parent_id, created_time, modified_time)
+        if file_id is not None:
+            metadata["id"] = file_id
         content_type = mime_type or _guess_mime(name)
 
         boundary = f"gdrivecopy_{uuid.uuid4().hex}"
@@ -662,6 +856,8 @@ class DriveClient:
             timeout=_HTTP_TIMEOUT,
             allow_redirects=False,
         )
+        if resp.status_code == 409 and file_id is not None:
+            return self.upload_result(file_id)
         self._check_errors(resp)
         if resp.status_code not in (200, 201):
             raise DriveApiError(502, f"Unexpected multipart upload status: HTTP {resp.status_code}")
@@ -673,7 +869,7 @@ class DriveClient:
 
     def trash_file(self, file_id: str) -> None:
         """Move a file to the Drive trash (recoverable)."""
-        _retry_transient(
+        self._retry(
             lambda: self._execute_service_request(
                 lambda: (
                     self._service.files().update(fileId=file_id, body={"trashed": True}).execute()

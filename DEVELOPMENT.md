@@ -1,44 +1,30 @@
 # Development guide
 
-## Repository map
+## Architecture
 
-| Path | Responsibility |
+| Module | Responsibility |
 |---|---|
-| `gdrivecopy/cli.py` | Argument validation, logging setup, dependency wiring, report/exit behavior |
-| `gdrivecopy/auth.py` | OAuth consent, refresh, and atomic token persistence |
-| `gdrivecopy/scanner.py` | Deterministic local traversal, metadata capture, exclusions, and scan errors |
-| `gdrivecopy/drive.py` | Drive metadata operations and raw resumable/multipart HTTP protocol |
-| `gdrivecopy/session.py` | Validated, thread-safe, atomic resumable-session cache |
-| `gdrivecopy/persistence.py` | Private temporary files and shared atomic replacement |
-| `gdrivecopy/uploader.py` | Classification, concurrency, retry, resume, throttling, and verification |
-| `gdrivecopy/report.py` | Human and JSON reports |
-| `gdrivecopy/models.py` | Shared immutable records, configuration, and mutable run statistics |
-| `tests/` | Offline unit and integration-style tests with mocked Google services |
-| `PRD.md` | Current product scope, safety invariants, and technical contract |
-| `.github/workflows/ci.yml` | Windows/Linux checks on Python 3.10 and 3.14 |
+| `cli.py`, `commands.py` | Help/parsing, account wiring, locks, signals, logging, exit codes |
+| `accounts.py`, `auth.py` | Profiles, server identity, OAuth and private token persistence |
+| `jobstore.py` | SQLite schema, manifests, checkpoints, audit, OS locks |
+| `inventory.py` | Persistent Drive tree, cursor recovery, change feed, folder adapter |
+| `transfer.py` | Fixed manifest, namespace preflight, reconciliation, dispatch, reports |
+| `uploader.py` | Multipart/resumable transfers, source checks, retry, checksum/cleanup |
+| `downloader.py` | Safe paths, durable ranges, checksum, export, no-clobber publication |
+| `drive.py` | Validated metadata operations and raw HTTP protocol |
+| `control.py`, `terminal.py` | Cancellation, bounded progress model, Rich dashboard/report |
+| `scanner.py` | Deterministic traversal, metadata, exclusions and errors |
+| `persistence.py` | Unique private temporary files, sync and atomic replacement |
+| `session.py`, `report.py`, `models.py` | Shared records and compatibility JSON state/reporting |
 
-There is no checked-in application data. Runtime files (`credentials.json`,
-`token.json`, `sessions.json`, logs, reports, coverage output, and build output)
-are ignored by Git.
+There is no personal data checked in. `tests/fake_drive.py` is synthetic offline
+test data. Runtime state/build outputs are ignored. Dependencies and tool
+settings live in `pyproject.toml`; `requirements.txt` installs the package itself.
 
-## Setup
+## Setup and validation
 
-Create an isolated Python 3.10+ environment, then install the package and
-development tools:
-
-```bash
+```powershell
 python -m pip install -e ".[dev]"
-```
-
-Runtime dependency versions live only in `pyproject.toml`. `requirements.txt`
-installs the project itself so it cannot drift into a second dependency list.
-Pytest and Ruff configuration also live in `pyproject.toml`.
-
-## Quality checks
-
-Run the same focused gates used for repository review:
-
-```bash
 python -m ruff format --check .
 python -m ruff check .
 python -m pytest --cov=gdrivecopy --cov-report=term-missing
@@ -46,81 +32,103 @@ python -m compileall -q gdrivecopy tests
 python -m pip wheel --no-deps --wheel-dir dist .
 ```
 
-The test suite must remain offline. Mock `DriveClient`, the discovery service,
-or `AuthorizedSession`; never use a real OAuth token in a test.
+CI in `.github/workflows/ci.yml` covers Windows/Linux on Python 3.10/3.14. Keep
+tests offline: mock OAuth, discovery and raw HTTP. A local Windows run alone
+does not validate every supported platform/interpreter.
 
-## Design constraints for changes
+## Building and releasing
 
-- Keep all source and Drive mutations explicit. The tool may only create Drive
-  folders/files and trash a newly created, unverified upload.
-- Treat duplicate names and uncertain server acknowledgements as data-integrity
-  problems, not cases for best-effort guessing.
-- Keep `UploadStats` mutations on the main thread. Workers return `_WorkerResult`.
-- Keep `SessionCache` internally synchronized and replace-atomic. Do not imply
-  that it is safe for multiple processes.
-- Bind sessions to the absolute source path, actual Drive parent ID, size, and
-  precise mtime. Legacy or changed identities must restart, not resume elsewhere.
-- Never send credentials or bytes to an unchecked cached URL. Validate the
-  supported Google upload origin/path and disable raw HTTP redirects.
-- Retain generated folder IDs across retries: a name lookup can lag after a
-  successful create with a lost response.
-- Session persistence is best effort, but in-memory state stays authoritative
-  for the running uploader. Disk errors must not bypass post-upload cleanup.
-- Preserve bounded dispatch: never submit the entire source tree to the executor
-  at once.
-- Keep a separate `AuthorizedSession` per worker thread. Do not serialize file
-  payload uploads through the discovery-client lock.
-- A retry after any ambiguous resumable failure must query the saved session
-  before sending more bytes.
-- Do not immediately retry an ambiguous multipart request. It has no status URI,
-  so the next program run must rescan Drive before deciding whether to resend.
-- A local read failure must occur before creating a small-file Drive item where
-  possible. If a completed item cannot be verified, clean it up before retry.
-- Exact tool-owned runtime paths remain mandatory exclusions even if general
-  include/exclude options are added later.
-- Update `README.md`, `PRD.md`, report JSON tests, and CLI tests together when a
-  user-visible field or behavior changes.
+Use an isolated Python environment on the target OS. PyInstaller produces a
+native executable plus support files; it is not a cross-compiler.
 
-## Test organization
+```sh
+python -m pip install ".[build]"
+python -m build
+python scripts/build_binary.py
+python scripts/release_checksums.py dist
+```
 
-- `test_auth.py`: valid, corrupt, missing, refreshed, and atomically saved tokens
-- `test_cli.py`: parsing, validation, configuration wiring, and exit statuses
-- `test_scanner.py`: ordering, timestamps, exclusions, symlinks, and errors
-- `test_drive.py`: listing, conflicts, folder idempotency, HTTP protocol, and errors
-- `test_session.py`: validation, persistence, and thread safety
-- `test_persistence.py`: failed replacement, temporary-link avoidance, and POSIX permissions
-- `test_integrity_regressions.py`: identity isolation, path collisions, recovery
-  cleanup, source replacement, authentication retry budget, and quota draining
-- `test_uploader.py`: classification, retry, resume, verification, mutation,
-  throttling, cancellation, folder creation, and run-level statistics
-- `test_report.py`: formatting and atomic JSON schema persistence
+The script builds into `dist/gdrivecopy`, runs help/version/offline diagnostics
+from outside the checkout, and archives the entire bundle. It includes the Drive
+discovery data, TLS certificates, runtime dependency licenses and exact build
+versions. It fetches the matching CPython license from the official CPython repo.
+Build files and generated specs stay under ignored `build/` and `dist/` paths.
 
-When fixing a bug, first add a regression test that fails for the unsafe or
-incorrect behavior. Prefer assertions about observable outcomes—Drive calls,
-cache retention, report fields, and exit status—over internal call ordering.
+`release.yml` builds Windows x64, Linux x64 and macOS ARM64 on main and version
+tags, tests each platform, and checks wheel/sdist metadata. Main builds are
+downloadable Actions artifacts. To release:
 
-## Manual integration checklist
+1. Update package version, changelog and `.github/RELEASE_NOTES.md`.
+2. Push reviewed changes to main and wait for quality/native-package checks.
+3. Tag that tested commit `vVERSION` and push the tag. Do not move published tags.
+4. The tag workflow rebuilds, checks the version, adds SHA-256 hashes, and
+   publishes all artifacts together. Download assets and verify hashes/launch.
 
-Automated tests cannot prove live Google behavior. Before a release intended for
-real migration work, use a disposable My Drive folder and non-sensitive files to
-verify:
+No PyPI upload, signing certificate or notarization is configured. Native builds
+are not byte-for-byte reproducible; `BUILD_INFO.json` records dependency versions
+and source commit for investigation. Offline tests do not replace live migration
+validation. Publishing requires repository Actions with contents-write permission
+only in the final publish job.
 
-1. First-time OAuth and cached-token refresh.
-2. Small, empty, and multi-chunk uploads.
-3. Process interruption followed by byte-level resume.
-4. Same-size skip and different-size conflict behavior.
-5. Nested folder creation and an intentional duplicate-folder conflict.
-6. MD5 verification and timestamps in Drive metadata.
-7. Aggregate bandwidth limiting with multiple workers.
-8. Report/log placement inside and outside the source tree.
-9. Recovery of a folder create whose response was lost, using its generated ID.
-10. Legacy session rejection and a restart using the new session identity fields.
+## State ordering
 
-CI adds the operating-system and Python-version matrix; a local Windows run
-alone does not validate the Linux/POSIX permission behavior or Python 3.10.
-Integration tests must also keep other writers away from the destination: the
-initial Drive listing is not a transactional snapshot.
+Each job has a SQLite WAL database with `synchronous=FULL`, schema version 1,
+and a process lock. Threads share a serialized connection. Transactions never
+span payload requests. Use a local filesystem with reliable sync/lock semantics.
 
-Never commit the live credentials, token, session URI, logs containing private
-paths, or sample personal data. Record the Python version and Google client
-library versions used for the integration pass.
+`meta` stores config/run summaries; `remote`, `folders`, `folder_seen` and
+`page_tokens` hold inventory; `files` contains the source plan, status, reserved
+ID, session, offset and receipt; `events` is append-only audit. Namespace tables
+detect file/directory aliases. Reports can open state read-only while a job runs.
+
+Critical orderings:
+
+1. Persist a generated create ID **before** sending payload; retry that ID after
+   a lost response. Persist folder IDs across restarts too.
+2. Write/fsync a download range **before** saving its offset. Truncate excess
+   bytes on resume, restart missing/short parts, rehash a verified prefix locally.
+3. Save the verification receipt **before** final publication. Windows rename
+   and POSIX hard-link publication refuse existing targets. Recover a gap
+   between publication and status by verifying local content/receipt.
+4. Recheck upload source identity before accepting completion. Trash a newly
+   created unverified item before trying another ID; failed cleanup stops.
+5. Capture a change cursor **before** the initial scan; commit cursor advance
+   together with affected-folder invalidation.
+
+Modern checkpoint/identity persistence errors stop the operation. Legacy JSON
+sessions retain best-effort persistence; do not extend that fallback to SQLite.
+
+## Concurrency and complexity
+
+Manifest batches are 500 rows; Drive pages are at most 1,000 items. Pending files
+use indexed keyset pagination and at most `transfers` futures. Never submit or
+display the whole manifest. Local scanning uses callbacks; `os.walk` still
+allocates one directory's entries and scan errors are retained for the run.
+
+Resume streams completed records, reads the database and stats completed local
+destinations. It is not constant-time in file count. Change feeds can be large
+on busy accounts. Payload memory includes worker chunks and temporary HTTP
+buffers: `workers × chunk_size` is not an exact memory ceiling.
+
+Small uploads can reread up to 8 MiB for hashing/multipart construction; large
+uploads hash while streaming. Validate cached upload URLs and disable raw HTTP
+redirects. Keep worker payload sessions separate from the metadata-client lock.
+
+## Tests and release gate
+
+Existing suites cover upload protocol, source identity, cleanup, legacy state,
+auth, scanning and reports. `test_jobs.py` covers durable jobs/crash boundaries;
+`test_download_protocol.py` validates responses independently of the fake server;
+`test_commands.py` covers profiles, CLI wiring and dashboard rendering. Assert
+observable safety properties rather than reproducing implementation details.
+
+Update README, operations guidance, PRD, CLI help and report consumers together.
+Fail closed on newer state schemas. Do not commit credentials, capabilities,
+private paths or real account identifiers in fixtures/screenshots.
+
+Before a real migration release, independently compare hashes in a disposable
+My Drive folder. Test OAuth/refresh, two accounts, empty/small/large transfers,
+exports, timestamps, conflicts, Ctrl+C, forced termination/reboot, pacing, quotas
+and reports. Record platform/dependency versions and measured rates. Offline
+tests cannot establish live Google behavior, all terminal renderers or sustained
+multi-terabyte throughput.
